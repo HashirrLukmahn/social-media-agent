@@ -2,16 +2,17 @@ export type AgentName = "meme-generator" | "social-media" | "analytics" | "orche
 
 export interface LogEntry {
   id: string;
-  correlationId?: string;
+  correlationId?: string | undefined;
   timestamp: string;
   agentName: AgentName;
   action: string;
   status: "success" | "failed" | "skipped" | "circuit-open";
-  durationMs?: number;
+  durationMs?: number | undefined;
   input?: unknown;
   output?: unknown;
-  error?: string;
+  error?: string | undefined;
 }
+
 
 export interface RetryOptions {
   attempts?: number;
@@ -25,9 +26,9 @@ export interface CircuitBreakerState {
   agentName: AgentName;
   consecutiveFailures: number;
   status: CircuitStatus;
-  openedAt?: string;
-  halfOpenAt?: string;
-  cooldownMs?: number;
+  openedAt?: string | undefined;
+  halfOpenAt?: string | undefined;
+  cooldownMs?: number | undefined;
 }
 
 export interface KillSwitchState {

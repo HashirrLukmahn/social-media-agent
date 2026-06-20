@@ -459,18 +459,18 @@ describe("correlationId threading", () => {
 
 describe("scoring formula (§4.1)", () => {
   it("weights reposts × 3, likes × 1, sentiment-adjusted replies × 1.5", async () => {
-    const { computeScore } = await import("../../agents/analytics/index.js");
+    const { computeScore } = await import("../../modules/analytics.js");
     // 2 reposts, 5 likes, 3 sentiment-adjusted replies → 6 + 5 + 4.5 = 15.5
     expect(computeScore(2, 5, 3)).toBeCloseTo(15.5);
   });
 
   it("returns 0 for zero engagement", async () => {
-    const { computeScore } = await import("../../agents/analytics/index.js");
+    const { computeScore } = await import("../../modules/analytics.js");
     expect(computeScore(0, 0, 0)).toBe(0);
   });
 
   it("returns correct score for reposts-only (highest weight signal)", async () => {
-    const { computeScore } = await import("../../agents/analytics/index.js");
+    const { computeScore } = await import("../../modules/analytics.js");
     expect(computeScore(10, 0, 0)).toBe(30); // 10 * 3
   });
 });

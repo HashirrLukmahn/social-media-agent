@@ -11,6 +11,9 @@ export interface StyleLog {
   niche: string;
   topics: StyleLogTopic[];
   formatNotes: string[];
+  // LLM-synthesized audience description — updated daily by analytics synthesis.
+  // Starts empty; grows more specific as real performance data accumulates.
+  audienceNotes: string;
   lastUpdated: string;
 }
 
@@ -38,6 +41,7 @@ export interface GeneratedMeme {
   caption: string;
   templateUsed: string;
   creditsUsed: number;
+  topic: string;
 }
 
 export interface RawEngagementMetrics {

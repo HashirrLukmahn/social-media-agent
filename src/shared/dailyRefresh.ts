@@ -4,6 +4,7 @@
 
 import { kvSet } from "../harness/store.js";
 import { getLatestStyleLogHistory, getRecentPostRecords } from "../harness/db.js";
+import { synthesizeStrategy } from "../modules/analytics.js";
 import type { CreditBudget, StyleLog } from "./types.js";
 import {
   NICHE,
@@ -21,6 +22,7 @@ export async function runDailyRefresh(): Promise<void> {
 
   await refreshStyleLog();
   await refreshCreditBudget();
+  await refreshStrategy();
 
   console.info("[daily-refresh] daily refresh complete");
 }
@@ -31,13 +33,16 @@ async function refreshStyleLog(): Promise<void> {
   let snapshot: StyleLog;
   if (latest) {
     snapshot = latest.snapshot as unknown as StyleLog;
+    // Backfill audienceNotes for logs written before this field existed.
+    if (snapshot.audienceNotes === undefined) {
+      snapshot = { ...snapshot, audienceNotes: "" };
+    }
   } else {
-    // First-ever run: empty seed. The seed script (§9) should populate this
-    // before go-live, but this prevents a crash if refresh runs before seed.
     snapshot = {
       niche: NICHE,
       topics: [],
       formatNotes: [],
+      audienceNotes: "",
       lastUpdated: new Date().toISOString(),
     };
     console.warn("[daily-refresh] no style log history found — using empty seed");
@@ -45,6 +50,25 @@ async function refreshStyleLog(): Promise<void> {
 
   await kvSet(STYLE_LOG_KEY, snapshot, TTL_SECONDS);
   console.info(`[daily-refresh] style_log:today written (${snapshot.topics.length} topics)`);
+}
+
+async function refreshStrategy(): Promise<void> {
+  const current = await import("../harness/store.js")
+    .then(({ kvGet }) => kvGet<StyleLog>(STYLE_LOG_KEY));
+  if (!current) return;
+
+  let updated: StyleLog;
+  try {
+    const { formatNotes, audienceNotes } = await synthesizeStrategy(current);
+    updated = { ...current, formatNotes, audienceNotes, lastUpdated: new Date().toISOString() };
+  } catch (err) {
+    // Strategy synthesis is best-effort — a Gemini failure must not block the refresh.
+    console.warn("[daily-refresh] strategy synthesis failed, keeping existing notes:", err instanceof Error ? err.message : err);
+    return;
+  }
+
+  await kvSet(STYLE_LOG_KEY, updated, TTL_SECONDS);
+  console.info(`[daily-refresh] strategy notes updated — ${updated.formatNotes.length} format notes`);
 }
 
 async function refreshCreditBudget(): Promise<void> {

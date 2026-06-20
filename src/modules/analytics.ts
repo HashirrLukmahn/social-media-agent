@@ -1,25 +1,23 @@
-// Analytics Agent
+// Analytics module
 // Responsibility: turn engagement data into the next generation's direction.
 // Owns the explore/exploit learning loop and the credit budget.
 
 import { GoogleGenAI } from "@google/genai";
-import { harnessedCall } from "../../harness/index.js";
-import { kvGet, kvSet } from "../../harness/store.js";
+import { harnessedCall } from "../harness/index.js";
+import { kvGet, kvSet } from "../harness/store.js";
 import {
   setPostScore,
   insertStyleLogHistory,
-  getLatestStyleLogHistory,
   getRecentPostRecords,
-  getPostMetricsForRecord,
-} from "../../harness/db.js";
+} from "../harness/db.js";
 import { v4 as uuidv4 } from "uuid";
-import type { RawEngagementMetrics, StyleLog, StyleLogTopic } from "../../shared/types.js";
+import type { RawEngagementMetrics, StyleLog, StyleLogTopic } from "../shared/types.js";
 import {
   NICHE,
   SCORE_WEIGHTS,
   EMERGING_MIN_POSTS,
   ESTABLISHED_MIN_POSTS,
-} from "../../shared/constants.js";
+} from "../shared/constants.js";
 
 const STYLE_LOG_KEY = "style_log:today";
 
@@ -91,7 +89,6 @@ async function updateStyleLog(
     return;
   }
 
-  // How many posts of this topic exist across different contexts?
   const allRecords = await getRecentPostRecords(NICHE, 90);
   const topicRecords = allRecords.filter((r) => r.topic === topic && r.score !== null);
 
@@ -127,7 +124,6 @@ async function updateStyleLog(
     lastUpdated: new Date().toISOString(),
   };
 
-  // Write new snapshot to Postgres history.
   await harnessedCall(
     {
       agentName: "analytics",
@@ -138,11 +134,103 @@ async function updateStyleLog(
     () => insertStyleLogHistory(NICHE, uuidv4(), updatedLog)
   );
 
-  // Also update today's Redis cache in-place so the rest of today's generation
-  // sessions see the updated topic weights immediately (exception to the
-  // "Redis is read-only during the day" rule — this is an Analytics write, not
-  // a re-generation of the full snapshot from Postgres).
+  // Update today's Redis cache so remaining generation slots see the updated
+  // topic weights immediately (spec §3.2 Analytics write exception).
   await kvSet(STYLE_LOG_KEY, updatedLog, 24 * 60 * 60);
+}
+
+// Looks at recent scored posts and asks Gemini what format and audience shifts
+// the data suggests. Output overwrites formatNotes and audienceNotes in the style log.
+// Called once per day from dailyRefresh — not per-post, to avoid noisy single-post signal.
+export async function synthesizeStrategy(
+  currentLog: StyleLog,
+  correlationId?: string
+): Promise<{ formatNotes: string[]; audienceNotes: string }> {
+  const recentRecords = await getRecentPostRecords(NICHE, 14);
+  const scoredRecords = recentRecords.filter((r) => r.score !== null);
+
+  // Not enough signal yet — return existing notes unchanged.
+  if (scoredRecords.length < 3) {
+    return { formatNotes: currentLog.formatNotes, audienceNotes: currentLog.audienceNotes };
+  }
+
+  const sorted = [...scoredRecords].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  const top = sorted.slice(0, 5);
+  const bottom = sorted.slice(-3);
+
+  const topLines = top
+    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} caption="${r.caption.slice(0, 80)}"`)
+    .join("\n");
+  const bottomLines = bottom
+    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} caption="${r.caption.slice(0, 80)}"`)
+    .join("\n");
+  const currentFormatNotes = currentLog.formatNotes.length > 0
+    ? currentLog.formatNotes.map((n) => `- ${n}`).join("\n")
+    : "(none yet)";
+
+  const prompt = `You are a content strategist for an autonomous Bluesky meme account in the software engineering space.
+
+Analyze the following engagement data from the last 14 days and provide updated content guidance.
+
+TOP PERFORMING POSTS (highest engagement scores):
+${topLines}
+
+LOWEST PERFORMING POSTS:
+${bottomLines}
+
+CURRENT FORMAT NOTES (may be stale — update or replace based on data):
+${currentFormatNotes}
+
+CURRENT AUDIENCE NOTES: ${currentLog.audienceNotes || "(none yet)"}
+
+Provide:
+1. Up to 4 specific, actionable format notes (caption style, tone, length, structure, humor type) derived from what's actually working in the data above
+2. An updated audience description (60 words max) — be specific about what this audience responds to; use the engagement data, not generic assumptions
+
+Respond with ONLY valid JSON, no markdown:
+{
+  "formatNotes": ["...", "..."],
+  "audienceNotes": "..."
+}`;
+
+  return harnessedCall(
+    {
+      agentName: "analytics",
+      action: "synthesize-strategy",
+      input: { scoredPosts: scoredRecords.length, topTopics: top.map((r) => r.topic) },
+      correlationId,
+      skipCircuitBreaker: true,
+    },
+    async () => {
+      const ai = getGemini();
+      const response = await ai.models.generateContent({
+        model: "gemini-2.0-flash",
+        contents: prompt,
+      });
+
+      const text = (response.text ?? "{}").trim();
+      // Strip markdown code fences if model wraps response despite instructions
+      const clean = text.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+
+      let parsed: { formatNotes?: unknown; audienceNotes?: unknown };
+      try {
+        parsed = JSON.parse(clean) as { formatNotes?: unknown; audienceNotes?: unknown };
+      } catch {
+        console.warn("[analytics] synthesize-strategy: could not parse Gemini response, keeping existing notes");
+        return { formatNotes: currentLog.formatNotes, audienceNotes: currentLog.audienceNotes };
+      }
+
+      const formatNotes = Array.isArray(parsed.formatNotes)
+        ? (parsed.formatNotes as unknown[]).filter((n): n is string => typeof n === "string")
+        : currentLog.formatNotes;
+      const audienceNotes = typeof parsed.audienceNotes === "string"
+        ? parsed.audienceNotes
+        : currentLog.audienceNotes;
+
+      console.info(`[analytics] strategy updated: ${formatNotes.length} format notes, audience: "${audienceNotes.slice(0, 60)}..."`);
+      return { formatNotes, audienceNotes };
+    }
+  );
 }
 
 export async function processMetrics(
@@ -150,14 +238,13 @@ export async function processMetrics(
   topic: string,
   correlationId?: string
 ): Promise<void> {
-  // Only score on the final checkpoint.
   if (metrics.checkpoint !== "24hr") {
     console.info(`[analytics] checkpoint ${metrics.checkpoint} received for ${metrics.slotId} — waiting for 24hr`);
     return;
   }
 
   const sentimentScore = await scoreSentiment([], correlationId); // TODO: pass actual reply texts
-  const sentimentAdjustedReplies = metrics.replies * ((sentimentScore + 1) / 2); // 0–replies range
+  const sentimentAdjustedReplies = metrics.replies * ((sentimentScore + 1) / 2);
   const score = computeScore(metrics.reposts, metrics.likes, sentimentAdjustedReplies);
 
   await harnessedCall(

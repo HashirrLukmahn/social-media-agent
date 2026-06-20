@@ -72,6 +72,7 @@ const INITIAL_STYLE_LOG: StyleLog = {
       lastUsed: new Date().toISOString(),
     },
   ],
+  audienceNotes: "",
   formatNotes: [
     "Single-panel captions perform well for relatable-pain topics",
     "Dry deadpan delivery lands better than over-explained setups",

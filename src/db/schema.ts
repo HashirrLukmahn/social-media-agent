@@ -7,6 +7,7 @@ import {
   jsonb,
 } from "drizzle-orm/pg-core";
 
+
 export const postRecords = pgTable("post_records", {
   slotId: text("slot_id").primaryKey(),
   niche: text("niche").notNull(),
@@ -53,4 +54,15 @@ export const styleLogHistory = pgTable("style_log_history", {
   niche: text("niche").notNull(),
   snapshot: jsonb("snapshot").notNull(), // full StyleLog object
   createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+export const scheduledJobs = pgTable("scheduled_jobs", {
+  id: text("id").primaryKey(), // `${slotId}:${checkpoint}`
+  slotId: text("slot_id").notNull(),
+  checkpoint: text("checkpoint").notNull(), // '1hr' | '6hr' | '24hr'
+  correlationId: text("correlation_id").notNull(),
+  blueskyUri: text("bluesky_uri").notNull(),
+  fireAt: timestamp("fire_at").notNull(),
+  firedAt: timestamp("fired_at"),
+  status: text("status").notNull().default("pending"), // 'pending' | 'fired' | 'failed'
 });

@@ -43,16 +43,19 @@ export async function log(entry: Omit<LogEntry, "id" | "timestamp">): Promise<vo
 
 export async function getRecentLogs(count = 100): Promise<LogEntry[]> {
   const rows = await getRecentRunLog(count);
-  return rows.map((r) => ({
-    id: r.id,
-    correlationId: r.correlationId ?? undefined,
-    timestamp: r.timestamp.toISOString(),
-    agentName: r.agentName as AgentName,
-    action: r.action,
-    status: r.status as LogEntry["status"],
-    durationMs: r.durationMs ?? undefined,
-    input: r.input ?? undefined,
-    output: r.output ?? undefined,
-    error: r.error ?? undefined,
-  }));
+  return rows.map((r) => {
+    const entry: LogEntry = {
+      id: r.id,
+      timestamp: r.timestamp.toISOString(),
+      agentName: r.agentName as AgentName,
+      action: r.action,
+      status: r.status as LogEntry["status"],
+    };
+    if (r.correlationId !== null) entry.correlationId = r.correlationId;
+    if (r.durationMs !== null) entry.durationMs = r.durationMs;
+    if (r.input !== null) entry.input = r.input;
+    if (r.output !== null) entry.output = r.output;
+    if (r.error !== null) entry.error = r.error;
+    return entry;
+  });
 }

@@ -35,10 +35,10 @@ interface HarnessedCallOptions extends RetryOptions {
   agentName: AgentName;
   action: string;
   input?: unknown;
-  correlationId?: string;
+  correlationId?: string | undefined;
   // Skip the circuit breaker for read-only / idempotent calls where failing
   // open is safer than refusing to run (e.g. reading the style log).
-  skipCircuitBreaker?: boolean;
+  skipCircuitBreaker?: boolean | undefined;
 }
 
 export async function harnessedCall<T>(

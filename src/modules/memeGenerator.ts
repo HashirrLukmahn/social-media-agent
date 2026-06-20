@@ -1,11 +1,7 @@
-// Meme Generator Agent
-// Pure function: style context in, meme out.
-// Knows nothing about Bluesky, scheduling, or analytics.
-
-import { harnessedCall } from "../../harness/index.js";
-import { kvGet, kvSet } from "../../harness/store.js";
-import type { CreditBudget, FallbackMeme, GeneratedMeme, StyleLog } from "../../shared/types.js";
-import { BLOCKED_TOPICS, NICHE, SAFETY_CONSTRAINTS } from "../../shared/constants.js";
+import { harnessedCall } from "../harness/index.js";
+import { kvGet, kvSet } from "../harness/store.js";
+import type { CreditBudget, FallbackMeme, GeneratedMeme, StyleLog } from "../shared/types.js";
+import { BLOCKED_TOPICS, SAFETY_CONSTRAINTS } from "../shared/constants.js";
 
 const CREDIT_BUDGET_KEY = "credit_budget:today";
 const STYLE_LOG_KEY = "style_log:today";
@@ -25,7 +21,7 @@ async function callMemelord(prompt: string): Promise<MemelordResponse> {
       Authorization: `Bearer ${process.env["MEMELORD_API_KEY"]}`,
     },
     body: JSON.stringify({ prompt }),
-    signal: AbortSignal.timeout(30_000), // 30s hard timeout per call
+    signal: AbortSignal.timeout(30_000),
   });
 
   if (!res.ok) {
@@ -40,10 +36,14 @@ function buildPrompt(styleLog: StyleLog, topic: string): string {
     ? `\nFormat guidance from past performance:\n${styleLog.formatNotes.map((n) => `- ${n}`).join("\n")}`
     : "";
 
+  const audienceGuidance = styleLog.audienceNotes
+    ? `\nAudience insight (derived from real engagement data):\n${styleLog.audienceNotes}`
+    : "";
+
   return `You are generating a software engineering humor meme for a Bluesky audience.
 
 Niche: ${styleLog.niche}
-Topic: ${topic}${formatGuidance}
+Topic: ${topic}${audienceGuidance}${formatGuidance}
 
 ${SAFETY_CONSTRAINTS}
 
@@ -61,12 +61,10 @@ function selectTopic(styleLog: StyleLog): string {
     return "debugging mysteries";
   }
 
-  // Explore/exploit: weight established > emerging > exploring.
-  // Early on (few established topics), picks from all with equal weight.
   const weights = safeCandidates.map((t) => {
     if (t.confidence === "established") return t.avgScore + 0.5;
     if (t.confidence === "emerging") return t.avgScore + 0.2;
-    return 0.1; // always keep some exploration weight
+    return 0.1;
   });
 
   const total = weights.reduce((a, b) => a + b, 0);
@@ -78,7 +76,7 @@ function selectTopic(styleLog: StyleLog): string {
   return safeCandidates[safeCandidates.length - 1]?.name ?? "debugging mysteries";
 }
 
-async function deductCredit(correlationId?: string): Promise<void> {
+async function deductCredit(): Promise<void> {
   const budget = await kvGet<CreditBudget>(CREDIT_BUDGET_KEY);
   if (!budget) {
     console.warn("[meme-generator] no credit budget found — skipping credit tracking");
@@ -95,7 +93,7 @@ async function deductCredit(correlationId?: string): Promise<void> {
   await kvSet(CREDIT_BUDGET_KEY, updated, 24 * 60 * 60);
 }
 
-async function getFallbackMeme(): Promise<GeneratedMeme | null> {
+export async function getFallbackMeme(): Promise<GeneratedMeme | null> {
   const bank = await kvGet<FallbackMeme[]>(FALLBACK_BANK_KEY);
   if (!bank || bank.length === 0) return null;
 
@@ -107,10 +105,11 @@ async function getFallbackMeme(): Promise<GeneratedMeme | null> {
     caption: meme.caption,
     templateUsed: "fallback",
     creditsUsed: 0,
+    topic: "fallback",
   };
 }
 
-export async function generate(slotId: string, correlationId?: string): Promise<GeneratedMeme> {
+export async function generateMeme(slotId: string, correlationId?: string): Promise<GeneratedMeme> {
   const styleLog = await kvGet<StyleLog>(STYLE_LOG_KEY);
   if (!styleLog) {
     throw new Error("Style log not found in Redis — run daily refresh first");
@@ -137,13 +136,14 @@ export async function generate(slotId: string, correlationId?: string): Promise<
       () => callMemelord(prompt)
     );
 
-    await deductCredit(correlationId);
+    await deductCredit();
 
     return {
       imageUrl: result.imageUrl,
       caption: result.caption,
       templateUsed: result.templateUsed,
       creditsUsed: 1,
+      topic,
     };
   } catch {
     console.warn("[meme-generator] generation failed, attempting fallback bank");

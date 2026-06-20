@@ -6,7 +6,7 @@
 // a circular dependency with harnessedCall.
 
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import { eq, desc, gte, and } from "drizzle-orm";
+import { eq, desc, gte, lte, and } from "drizzle-orm";
 import postgres from "postgres";
 import * as schema from "../db/schema.js";
 import type { StyleLog } from "../shared/types.js";
@@ -133,4 +133,50 @@ export async function getPostMetricsForRecord(
     .from(schema.postMetrics)
     .where(eq(schema.postMetrics.postId, slotId))
     .orderBy(schema.postMetrics.recordedAt);
+}
+
+export async function getPostRecord(
+  slotId: string
+): Promise<typeof schema.postRecords.$inferSelect | null> {
+  const rows = await getDb()
+    .select()
+    .from(schema.postRecords)
+    .where(eq(schema.postRecords.slotId, slotId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export async function insertScheduledJob(
+  job: typeof schema.scheduledJobs.$inferInsert
+): Promise<void> {
+  await getDb()
+    .insert(schema.scheduledJobs)
+    .values(job)
+    .onConflictDoNothing();
+}
+
+export async function getDueScheduledJobs(): Promise<(typeof schema.scheduledJobs.$inferSelect)[]> {
+  return getDb()
+    .select()
+    .from(schema.scheduledJobs)
+    .where(
+      and(
+        eq(schema.scheduledJobs.status, "pending"),
+        lte(schema.scheduledJobs.fireAt, new Date())
+      )
+    );
+}
+
+export async function markScheduledJobFired(id: string): Promise<void> {
+  await getDb()
+    .update(schema.scheduledJobs)
+    .set({ firedAt: new Date(), status: "fired" })
+    .where(eq(schema.scheduledJobs.id, id));
+}
+
+export async function markScheduledJobFailed(id: string): Promise<void> {
+  await getDb()
+    .update(schema.scheduledJobs)
+    .set({ status: "failed" })
+    .where(eq(schema.scheduledJobs.id, id));
 }
