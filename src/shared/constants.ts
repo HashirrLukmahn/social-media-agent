@@ -2,9 +2,10 @@
 export const NICHE = process.env["NICHE"] ?? "software-engineering";
 
 // Topics that must never be selected for generation, regardless of style log.
+// NOTE: "layoffs"/"firing" were removed — layoff / "replaced by AI" humor is a core
+// part of this account's niche. It's still constrained by SAFETY_CONSTRAINTS to stay
+// self-deprecating and in-on-the-joke (never mocking people actually affected).
 export const BLOCKED_TOPICS: readonly string[] = [
-  "layoffs",
-  "firing",
   "immigrants",
   "politics",
   "religion",
@@ -36,10 +37,11 @@ export const DEFAULT_HASHTAGS = ["#softwareengineering", "#devhumor", "#buildinp
 export const SAFETY_CONSTRAINTS = `
 NEVER generate content that:
 - Targets any nationality, ethnicity, gender, or religion
-- Makes light of mental health, job loss, or financial hardship
+- Makes light of mental health, self-harm, or serious personal/financial ruin
 - References real named individuals
 - Is politically charged in any direction
-- Punches down at junior developers or beginners
+- Punches down at people genuinely struggling — layoff and "replaced by AI" humor is
+  fine but must stay self-deprecating and in-on-the-joke, never mocking those affected
 `.trim();
 
 // Confidence tier thresholds (§4.1 of spec).

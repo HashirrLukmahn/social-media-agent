@@ -7,12 +7,13 @@ import { getLatestStyleLogHistory, getRecentPostRecords } from "../harness/db.js
 import { synthesizeStrategy } from "../modules/analytics.js";
 import { fetchTrendingThemes } from "../modules/trendingThemes.js";
 import { fetchCurrentEvents } from "../modules/currentEvents.js";
-import type { GenerationCap, StyleLog } from "./types.js";
+import type { GenerationCap, StyleLog, StyleLogTopic } from "./types.js";
 import {
   NICHE,
   MANDATORY_GENERATIONS,
   EXPLORATORY_GENERATIONS,
 } from "./constants.js";
+import { SEED_TOPICS } from "./config.js";
 
 const STYLE_LOG_KEY = "style_log:today";
 const GENERATION_CAP_KEY = "generation_cap:today";
@@ -63,8 +64,30 @@ async function refreshStyleLog(): Promise<void> {
     console.warn("[daily-refresh] no style log history found — using empty seed");
   }
 
+  snapshot = mergeSeedTopics(snapshot);
+
   await kvSet(STYLE_LOG_KEY, snapshot, TTL_SECONDS);
   console.info(`[daily-refresh] style_log:today written (${snapshot.topics.length} topics)`);
+}
+
+// Ensure every configured SEED_TOPIC is present in the style log so the bot covers
+// them from day one. Existing topics (with their learned scores) are preserved; only
+// missing seeds are appended as low-confidence "exploring" candidates, which the
+// analytics loop then promotes or demotes based on real engagement.
+function mergeSeedTopics(snapshot: StyleLog): StyleLog {
+  if (SEED_TOPICS.length === 0) return snapshot;
+  const existing = new Set(snapshot.topics.map((t) => t.name.toLowerCase()));
+  const now = new Date().toISOString();
+  const seeded: StyleLogTopic[] = SEED_TOPICS.filter(
+    (name) => !existing.has(name.toLowerCase())
+  ).map((name) => ({
+    name,
+    timesGenerated: 0,
+    avgScore: 0,
+    confidence: "exploring",
+    lastUsed: now,
+  }));
+  return seeded.length > 0 ? { ...snapshot, topics: [...snapshot.topics, ...seeded] } : snapshot;
 }
 
 async function refreshStrategy(): Promise<void> {
