@@ -4,85 +4,26 @@
 // Usage: npm run seed
 //
 // What it does:
-//   1. Writes the initial style log to Postgres style_log_history
+//   1. Builds the initial style log via buildInitialStyleLog() — scrapes
+//      STYLE_SEED_ACCOUNTS (Apify) + runs a Claude style-extraction pass (§9
+//      steps 1-2), with a generic fallback if accounts are unset or it fails —
+//      then writes it to Postgres style_log_history.
 //   2. Runs the daily refresh to populate Redis from it
 //   3. Writes 3 fallback bank memes to Redis
 //   4. Verifies kill_switch is set to false (system live)
 
+import "../shared/env.js"; // must be first — loads .env before anything reads process.env
 import { insertStyleLogHistory } from "../harness/db.js";
 import { kvSet, kvGet } from "../harness/store.js";
 import { runDailyRefresh } from "../shared/dailyRefresh.js";
+import { buildInitialStyleLog } from "../modules/styleSeed.js";
 import { v4 as uuidv4 } from "uuid";
-import type { FallbackMeme, StyleLog } from "../shared/types.js";
+import type { FallbackMeme } from "../shared/types.js";
 import { NICHE } from "../shared/constants.js";
 import type { KillSwitchState } from "../harness/types.js";
 
-// Initial style log based on style-guide extraction from reference memes.
-// Populate this via the Apify scraping + Gemini extraction pipeline from §9.
-const INITIAL_STYLE_LOG: StyleLog = {
-  niche: NICHE,
-  topics: [
-    {
-      name: "debugging mysteries",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-    {
-      name: "deployment anxiety",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-    {
-      name: "code review pain",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-    {
-      name: "interview performance",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-    {
-      name: "legacy codebase",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-    {
-      name: "documentation gaps",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-    {
-      name: "standup theater",
-      timesGenerated: 0,
-      avgScore: 0,
-      confidence: "exploring",
-      lastUsed: new Date().toISOString(),
-    },
-  ],
-  audienceNotes: "",
-  formatNotes: [
-    "Single-panel captions perform well for relatable-pain topics",
-    "Dry deadpan delivery lands better than over-explained setups",
-    "Setup/punchline can be implicit — let the image carry context",
-  ],
-  lastUpdated: new Date().toISOString(),
-};
-
-// Pre-approved evergreen fallback memes — replace URLs with real Memelord-generated
-// images created and manually reviewed before go-live.
+// Pre-approved evergreen fallback memes — replace URLs with real, manually-reviewed
+// meme images (e.g. generated via Memegen.link) before go-live.
 const FALLBACK_BANK: FallbackMeme[] = [
   {
     id: uuidv4(),
@@ -107,9 +48,10 @@ const FALLBACK_BANK: FallbackMeme[] = [
 async function main(): Promise<void> {
   console.info("[seed] starting one-time setup...");
 
-  // Step 1: write initial style log to Postgres
-  await insertStyleLogHistory(NICHE, uuidv4(), INITIAL_STYLE_LOG);
-  console.info("[seed] initial style log written to Postgres");
+  // Step 1: build the initial style log (scrape + extract) and write it to Postgres
+  const styleLog = await buildInitialStyleLog();
+  await insertStyleLogHistory(NICHE, uuidv4(), styleLog);
+  console.info(`[seed] initial style log written to Postgres (${styleLog.topics.length} topics)`);
 
   // Step 2: run daily refresh to populate Redis from Postgres
   await runDailyRefresh();
@@ -132,7 +74,7 @@ async function main(): Promise<void> {
   console.info("[seed] setup complete. Next steps:");
   console.info("  1. Replace fallback_bank image URLs with real reviewed memes");
   console.info("  2. Write and post the account bio + pinned post manually (§5 of spec)");
-  console.info("  3. Deploy all 4 Railway processes");
+  console.info("  3. Deploy the app process");
 }
 
 main().catch((err) => {

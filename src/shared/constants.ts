@@ -22,14 +22,17 @@ export const POSTING_WINDOWS: ReadonlyArray<{ openH: number; openM: number; clos
   { openH: 23, openM: 0, closeH: 0,  closeM: 30 }, // 6:00–7:30 PM EST (spans midnight UTC)
 ];
 
-export const DAILY_CREDIT_LIMIT = 20;
-export const CREDIT_SCHEDULED_POSTS = 3;
-export const CREDIT_EXPLORATION_BUDGET = 5;
+// Daily generation pacing cap (§4 — replaces the old Memelord credit budget).
+// Memegen.link is free and Magic Hour is exploratory-only, so this is a simple
+// self-imposed count, not a spend budget. 3 mandatory (one per scheduled post)
+// + up to 5 exploratory = 8 generations/day max.
+export const MANDATORY_GENERATIONS = 3;
+export const EXPLORATORY_GENERATIONS = 5;
 
 // Bluesky hashtags for discovery. Tune based on style log engagement data.
 export const DEFAULT_HASHTAGS = ["#softwareengineering", "#devhumor", "#buildinpublic"] as const;
 
-// Memelord prompt safety constraints baked into every generation request.
+// Safety constraints baked into every meme-generation request (§6 layer 1).
 export const SAFETY_CONSTRAINTS = `
 NEVER generate content that:
 - Targets any nationality, ethnicity, gender, or religion

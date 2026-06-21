@@ -1,66 +1,47 @@
 // example-usage.ts
 //
-// This is NOT part of the harness package — it's a worked example showing
-// how the meme generator agent would actually call Memelord through the
-// harness. Each agent does this same pattern for its own external calls
-// (social media agent → Bluesky, analytics agent → Mem0/Gemini, etc).
+// NOT part of the app (excluded from the build) — a worked example of how a meme
+// is generated through the harness. The real implementation lives in
+// src/modules/memeGenerator.ts + src/modules/memegen.ts.
+//
+// The default generation path is Memegen.link: a free, keyless GET that returns
+// the finished image. Each external call still goes through harnessedCall(), so it
+// inherits the kill-switch / circuit-breaker / retry / logging treatment.
 
-import { harnessedCall, isPaused } from "./index.js";
+import { harnessedCall, isPaused } from "./src/harness/index.js";
+import { renderMemegen } from "./src/modules/memegen.js";
 
-interface MemelordResponse {
-  imageUrl: string;
-  templateUsed: string;
-}
-
-async function callMemelord(prompt: string): Promise<MemelordResponse> {
-  const res = await fetch("https://api.memelord.com/v1/generate", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.MEMELORD_API_KEY}`,
-    },
-    body: JSON.stringify({ prompt }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Memelord API returned ${res.status}: ${await res.text()}`);
-  }
-
-  return res.json() as Promise<MemelordResponse>;
-}
-
-// This is what the meme generator agent actually calls.
-export async function generateMeme(prompt: string): Promise<MemelordResponse> {
+// This is the shape of what the Meme Generator actually does for the render step:
+// an LLM picks the template + text, then we render it via Memegen.link.
+export async function renderExample(): Promise<string> {
   return harnessedCall(
     {
       agentName: "meme-generator",
-      action: "generate-meme",
-      input: { prompt },
+      action: "memegen-render",
+      input: { template: "drake" },
       attempts: 3,
       baseDelayMs: 1000,
     },
-    () => callMemelord(prompt)
+    () => renderMemegen("drake", ["Writing tests after the bug ships", "Writing tests before"])
   );
 }
 
 // Example: what happens on each path.
 async function demo() {
-  // Path 1 — kill switch is off, circuit is closed, Memelord responds fine.
+  // Path 1 — kill switch off, circuit closed, Memegen.link responds fine.
   // → succeeds, logged as "success", circuit breaker reset to 0 failures.
-  const meme = await generateMeme(
-    "junior dev deploying on a Friday, dry deadpan caption, no names"
-  );
-  console.log("Generated:", meme.imageUrl);
+  const imageUrl = await renderExample();
+  console.log("Generated:", imageUrl);
 
-  // Path 2 — if Memelord times out 3x in a row across separate generate calls,
-  // the circuit trips. The 4th call fails fast with CircuitOpenError instead
-  // of waiting through 3 more retries — and OpenClaw can check this before
-  // even bothering to ping the meme generator for the next post.
+  // Path 2 — if Memegen.link fails 3x in a row across separate render calls, the
+  // circuit trips. The 4th call fails fast with CircuitOpenError instead of
+  // retrying — and the Meme Generator falls back to the pre-approved fallback bank.
 
-  // Path 3 — if someone has flipped the kill switch (e.g. you noticed a bad
-  // post and paused everything), every subsequent harnessedCall across all
-  // three agents throws HarnessPausedError immediately, no exceptions.
+  // Path 3 — if the kill switch is flipped (e.g. a takedown fired), every
+  // subsequent harnessedCall throws HarnessPausedError immediately.
   if (await isPaused()) {
-    console.log("Agent system is paused — nothing will post right now.");
+    console.log("System is paused — nothing will post right now.");
   }
 }
+
+void demo;

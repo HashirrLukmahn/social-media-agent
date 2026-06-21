@@ -1,14 +1,14 @@
 // Full multi-layer safety chain per spec §6.
 // Kept as its own module so it remains easy to point to and explain in the walkthrough.
 
-import { GoogleGenAI } from "@google/genai";
 import { harnessedCall } from "../harness/index.js";
+import { completeText } from "../shared/llm.js";
 import { generateMeme, getFallbackMeme } from "./memeGenerator.js";
 import type { GeneratedMeme } from "../shared/types.js";
 
 const SAFETY_REVIEW_PROMPT = `You are a content safety reviewer for a software engineering meme account on Bluesky.
 The account is run by an AI and the audience is professional software developers.
-Review the following meme caption and flag it if it:
+Review the meme caption in the user message and flag it if it:
 - Contains anything insensitive, offensive, or harmful
 - Targets any demographic group (nationality, ethnicity, gender, religion, age)
 - Makes light of serious topics (mental health, job loss, financial hardship, self-harm)
@@ -18,17 +18,7 @@ Review the following meme caption and flag it if it:
 
 Respond with ONLY one of:
 SAFE
-FLAGGED: <brief reason>
-
-Caption to review:`;
-
-let gemini: GoogleGenAI | null = null;
-
-function getGemini(): GoogleGenAI {
-  if (gemini) return gemini;
-  gemini = new GoogleGenAI({ apiKey: process.env["GEMINI_API_KEY"] ?? "" });
-  return gemini;
-}
+FLAGGED: <brief reason>`;
 
 export async function reviewSafety(
   meme: GeneratedMeme,
@@ -43,13 +33,12 @@ export async function reviewSafety(
       skipCircuitBreaker: false,
     },
     async () => {
-      const ai = getGemini();
-      const response = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: `${SAFETY_REVIEW_PROMPT}\n\n${meme.caption}`,
+      const text = await completeText({
+        system: SAFETY_REVIEW_PROMPT,
+        user: meme.caption,
+        maxTokens: 64,
       });
 
-      const text = (response.text ?? "").trim();
       if (text.startsWith("SAFE")) {
         return { status: "SAFE" as const };
       }

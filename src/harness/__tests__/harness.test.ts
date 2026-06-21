@@ -1,5 +1,5 @@
 // Unit tests for the harness module.
-// Covers: Redis failure, Memelord timeout, kill-switch mid-call, circuit breaker
+// Covers: Redis failure, image API timeout, kill-switch mid-call, circuit breaker
 // half-open recovery, and correlationId propagation.
 //
 // Run: npm test
@@ -272,9 +272,9 @@ describe("harnessedCall — Redis failure mid-operation", () => {
   });
 });
 
-// ─── Memelord timeout simulation ─────────────────────────────────────────────
+// ─── Image API timeout simulation ────────────────────────────────────────────
 
-describe("harnessedCall — Memelord timeout simulation", () => {
+describe("harnessedCall — image API timeout simulation", () => {
   it("trips circuit breaker after 3 consecutive timeouts (one retry each)", async () => {
     withKillSwitch(false);
     // No pre-existing circuit state — starts closed.
@@ -363,7 +363,7 @@ describe("harnessedCall — kill switch flipped mid-retry", () => {
             // Flip kill switch after the first attempt fails.
             withKillSwitch(true);
           }
-          throw new Error("Memelord down");
+          throw new Error("image API down");
         }
       )
         .then(() => resolve(null))
@@ -374,7 +374,7 @@ describe("harnessedCall — kill switch flipped mid-retry", () => {
     // Should have aborted very early — not run all 5 attempts.
     expect(attemptCount).toBeLessThanOrEqual(3);
     // Error message comes from either the abort or the kill switch check.
-    expect(error?.message).toMatch(/[Aa]bort|kill switch|paused|Memelord/);
+    expect(error?.message).toMatch(/[Aa]bort|kill switch|paused|image API/);
   });
 });
 

@@ -1,5 +1,15 @@
 # Build Log & Next-Build Suggestions
 
+## Build 2 — 2026-06-21 (Memelord removed)
+
+Memelord was never legitimate (dead endpoint, non-working key). Removed entirely and
+replaced with: **Memegen.link** (free, keyless, default path) for all generation
+incl. the 3 mandatory posts, and **Magic Hour** (`magic-hour` SDK) for exploratory
+slots only, with reactive fallback to Memegen.link on a 402 depleted balance. The
+old per-call Memelord "credit budget" became a simple **generation cap** (3 mandatory
++ 5 exploratory/day) in Redis `generation_cap:today`. `MEMELORD_API_KEY` removed;
+`MAGICHOUR_API_KEY` added (optional).
+
 ## Build 1 — 2026-06-19
 
 ### What was built
@@ -90,7 +100,7 @@ Priority order:
 2. Fetch actual reply texts for sentiment (currently scoring against empty list)
 3. Persistent `last_refresh_day` key in Redis (not in-process variable, breaks on restart)
 4. Alerting when circuit-open count spikes (needed before unsupervised launch)
-5. Mem0 SDK integration (stub only)
-6. Replace fallback bank placeholder image URLs with real Memelord images
+5. Mem0 qualitative memory — DONE. Wired into Analytics: `synthesizeStrategy` recalls prior cross-cutting learnings from Mem0 to inform the daily strategy pass and stores newly-derived ones (e.g. day-of-week effects), alongside the structured Postgres style log (§3.5). NOTE: the earlier "stub only" label was inaccurate — there was no stub; the `mem0ai` SDK was installed but entirely unused until this change.
+6. Replace fallback bank placeholder image URLs with real, reviewed meme images (e.g. via Memegen.link)
 7. Redis MULTI/EXEC for style log mid-day update (race condition on concurrent processes)
 8. A/B variant generation (budget exists, not implemented)

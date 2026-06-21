@@ -5,24 +5,27 @@
 import { kvSet } from "../harness/store.js";
 import { getLatestStyleLogHistory, getRecentPostRecords } from "../harness/db.js";
 import { synthesizeStrategy } from "../modules/analytics.js";
-import type { CreditBudget, StyleLog } from "./types.js";
+import { fetchTrendingThemes } from "../modules/trendingThemes.js";
+import { fetchCurrentEvents } from "../modules/currentEvents.js";
+import type { GenerationCap, StyleLog } from "./types.js";
 import {
   NICHE,
-  DAILY_CREDIT_LIMIT,
-  CREDIT_SCHEDULED_POSTS,
-  CREDIT_EXPLORATION_BUDGET,
+  MANDATORY_GENERATIONS,
+  EXPLORATORY_GENERATIONS,
 } from "./constants.js";
 
 const STYLE_LOG_KEY = "style_log:today";
-const CREDIT_BUDGET_KEY = "credit_budget:today";
+const GENERATION_CAP_KEY = "generation_cap:today";
 const TTL_SECONDS = 24 * 60 * 60; // 24hr
 
 export async function runDailyRefresh(): Promise<void> {
   console.info("[daily-refresh] starting daily refresh...");
 
   await refreshStyleLog();
-  await refreshCreditBudget();
+  await refreshGenerationCap();
   await refreshStrategy();
+  await refreshTrendingThemes();
+  await refreshCurrentEvents();
 
   console.info("[daily-refresh] daily refresh complete");
 }
@@ -33,9 +36,18 @@ async function refreshStyleLog(): Promise<void> {
   let snapshot: StyleLog;
   if (latest) {
     snapshot = latest.snapshot as unknown as StyleLog;
-    // Backfill audienceNotes for logs written before this field existed.
+    // Backfill fields for logs written before they existed.
     if (snapshot.audienceNotes === undefined) {
       snapshot = { ...snapshot, audienceNotes: "" };
+    }
+    if (snapshot.trendingThemes === undefined) {
+      snapshot = { ...snapshot, trendingThemes: [] };
+    }
+    if (snapshot.currentEventsContext === undefined) {
+      snapshot = { ...snapshot, currentEventsContext: [] };
+    }
+    if (snapshot.publicSentimentTowardDevs === undefined) {
+      snapshot = { ...snapshot, publicSentimentTowardDevs: null };
     }
   } else {
     snapshot = {
@@ -43,6 +55,9 @@ async function refreshStyleLog(): Promise<void> {
       topics: [],
       formatNotes: [],
       audienceNotes: "",
+      trendingThemes: [],
+      currentEventsContext: [],
+      publicSentimentTowardDevs: null,
       lastUpdated: new Date().toISOString(),
     };
     console.warn("[daily-refresh] no style log history found — using empty seed");
@@ -62,7 +77,7 @@ async function refreshStrategy(): Promise<void> {
     const { formatNotes, audienceNotes } = await synthesizeStrategy(current);
     updated = { ...current, formatNotes, audienceNotes, lastUpdated: new Date().toISOString() };
   } catch (err) {
-    // Strategy synthesis is best-effort — a Gemini failure must not block the refresh.
+    // Strategy synthesis is best-effort — a model failure must not block the refresh.
     console.warn("[daily-refresh] strategy synthesis failed, keeping existing notes:", err instanceof Error ? err.message : err);
     return;
   }
@@ -71,27 +86,59 @@ async function refreshStrategy(): Promise<void> {
   console.info(`[daily-refresh] strategy notes updated — ${updated.formatNotes.length} format notes`);
 }
 
-async function refreshCreditBudget(): Promise<void> {
-  // Query recent posts to determine how many credits were spent yesterday
-  // (for logging purposes — today's budget always resets to the default split).
+// §3.7 step 1 — scrape reference accounts and write abstracted trending themes onto
+// style_log:today. fetchTrendingThemes() never throws (returns [] on empty config or
+// any failure), so this can only no-op, never block the rest of the refresh.
+async function refreshTrendingThemes(): Promise<void> {
+  const current = await import("../harness/store.js")
+    .then(({ kvGet }) => kvGet<StyleLog>(STYLE_LOG_KEY));
+  if (!current) return;
+
+  const trendingThemes = await fetchTrendingThemes();
+  const updated: StyleLog = { ...current, trendingThemes, lastUpdated: new Date().toISOString() };
+
+  await kvSet(STYLE_LOG_KEY, updated, TTL_SECONDS);
+  console.info(`[daily-refresh] trending themes updated — ${trendingThemes.length} themes`);
+}
+
+// §3.7 step 2 — one Claude web-search call for today's tech/cultural context, written
+// onto style_log:today. fetchCurrentEvents() never throws (returns [] on any failure),
+// so this can only no-op, never block the rest of the refresh.
+async function refreshCurrentEvents(): Promise<void> {
+  const current = await import("../harness/store.js")
+    .then(({ kvGet }) => kvGet<StyleLog>(STYLE_LOG_KEY));
+  if (!current) return;
+
+  const { currentEventsContext, publicSentimentTowardDevs } = await fetchCurrentEvents();
+  const updated: StyleLog = {
+    ...current,
+    currentEventsContext,
+    publicSentimentTowardDevs,
+    lastUpdated: new Date().toISOString(),
+  };
+
+  await kvSet(STYLE_LOG_KEY, updated, TTL_SECONDS);
+  console.info(
+    `[daily-refresh] current events updated — ${currentEventsContext.length} bullets, sentiment=${publicSentimentTowardDevs?.tone ?? "none"}`
+  );
+}
+
+async function refreshGenerationCap(): Promise<void> {
+  // Count yesterday's generations for logging only — today's cap always resets.
   const recentRecords = await getRecentPostRecords(NICHE, 1);
   const generatedYesterday = recentRecords.filter(
     (r) => r.generatedAt > new Date(Date.now() - 24 * 60 * 60 * 1000)
   ).length;
 
-  const buffer = DAILY_CREDIT_LIMIT - CREDIT_SCHEDULED_POSTS - CREDIT_EXPLORATION_BUDGET;
-  const budget: CreditBudget = {
+  const cap: GenerationCap = {
     date: new Date().toISOString().split("T")[0] ?? new Date().toISOString().slice(0, 10),
-    totalAllotted: DAILY_CREDIT_LIMIT,
-    scheduledPosts: CREDIT_SCHEDULED_POSTS,
-    exploration: CREDIT_EXPLORATION_BUDGET,
-    buffer,
-    spent: 0,
-    remaining: DAILY_CREDIT_LIMIT,
+    mandatory: MANDATORY_GENERATIONS,
+    exploratory: EXPLORATORY_GENERATIONS,
+    used: 0,
   };
 
-  await kvSet(CREDIT_BUDGET_KEY, budget, TTL_SECONDS);
+  await kvSet(GENERATION_CAP_KEY, cap, TTL_SECONDS);
   console.info(
-    `[daily-refresh] credit_budget:today written (total=${budget.totalAllotted}, yesterday posts=${generatedYesterday})`
+    `[daily-refresh] generation_cap:today written (max=${cap.mandatory + cap.exploratory}, yesterday posts=${generatedYesterday})`
   );
 }

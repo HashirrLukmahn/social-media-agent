@@ -3,6 +3,7 @@
 // That way a bug or restart in the orchestrator can't bypass the pause.
 
 import { kvGet, kvSet } from "./store.js";
+import { sendAlert } from "./alert.js";
 import type { KillSwitchState } from "./types.js";
 
 const KILL_SWITCH_KEY = "kill_switch";
@@ -18,7 +19,14 @@ export async function pause(reason: string): Promise<void> {
     reason,
     pausedAt: new Date().toISOString(),
   };
-  await kvSet(KILL_SWITCH_KEY, state);
+  try {
+    await kvSet(KILL_SWITCH_KEY, state);
+  } finally {
+    // Any kill-switch engage (crash handler, §6.1 takedown, or manual pause) pings
+    // Slack so a human sees it. Runs even if the state write above failed, so a
+    // Redis outage during a halt is never silent. sendAlert never throws.
+    await sendAlert(`🚨 Kill switch ENGAGED — system paused.\nReason: ${reason}`);
+  }
 }
 
 export async function resume(): Promise<void> {

@@ -1,9 +1,10 @@
 // Analytics module
 // Responsibility: turn engagement data into the next generation's direction.
-// Owns the explore/exploit learning loop and the credit budget.
+// Owns the explore/exploit learning loop and the daily generation cap.
 
-import { GoogleGenAI } from "@google/genai";
 import { harnessedCall } from "../harness/index.js";
+import { completeText } from "../shared/llm.js";
+import { recallLearnings, addLearning } from "../shared/mem0.js";
 import { kvGet, kvSet } from "../harness/store.js";
 import {
   setPostScore,
@@ -21,14 +22,6 @@ import {
 
 const STYLE_LOG_KEY = "style_log:today";
 
-let gemini: GoogleGenAI | null = null;
-
-function getGemini(): GoogleGenAI {
-  if (gemini) return gemini;
-  gemini = new GoogleGenAI({ apiKey: process.env["GEMINI_API_KEY"] ?? "" });
-  return gemini;
-}
-
 async function scoreSentiment(
   replies: string[],
   correlationId?: string
@@ -44,20 +37,14 @@ async function scoreSentiment(
       skipCircuitBreaker: true, // read-only, safe to fail open
     },
     async () => {
-      const ai = getGemini();
-      const prompt = `You are analyzing replies to a software engineering meme on Bluesky.
+      const text = await completeText({
+        system: `You are analyzing replies to a software engineering meme on Bluesky.
 Rate the overall sentiment of these replies on a scale from -1.0 (very negative, meme didn't land)
-to 1.0 (very positive, meme resonated well). Return only a JSON object: { "score": <number> }
-
-Replies:
-${replies.slice(0, 20).map((r, i) => `${i + 1}. ${r}`).join("\n")}`;
-
-      const response = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: prompt,
+to 1.0 (very positive, meme resonated well). Return only a JSON object: { "score": <number> }`,
+        user: `Replies:\n${replies.slice(0, 20).map((r, i) => `${i + 1}. ${r}`).join("\n")}`,
+        maxTokens: 64,
       });
 
-      const text = response.text ?? "{}";
       const match = text.match(/"score"\s*:\s*(-?\d+(?:\.\d+)?)/);
       const score = match ? parseFloat(match[1] ?? "0") : 0;
       return Math.max(-1, Math.min(1, score));
@@ -139,7 +126,7 @@ async function updateStyleLog(
   await kvSet(STYLE_LOG_KEY, updatedLog, 24 * 60 * 60);
 }
 
-// Looks at recent scored posts and asks Gemini what format and audience shifts
+// Looks at recent scored posts and asks Claude what format and audience shifts
 // the data suggests. Output overwrites formatNotes and audienceNotes in the style log.
 // Called once per day from dailyRefresh — not per-post, to avoid noisy single-post signal.
 export async function synthesizeStrategy(
@@ -159,20 +146,39 @@ export async function synthesizeStrategy(
   const bottom = sorted.slice(-3);
 
   const topLines = top
-    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} caption="${r.caption.slice(0, 80)}"`)
+    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} day=${weekday(r.generatedAt)} caption="${r.caption.slice(0, 80)}"`)
     .join("\n");
   const bottomLines = bottom
-    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} caption="${r.caption.slice(0, 80)}"`)
+    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} day=${weekday(r.generatedAt)} caption="${r.caption.slice(0, 80)}"`)
     .join("\n");
   const currentFormatNotes = currentLog.formatNotes.length > 0
     ? currentLog.formatNotes.map((n) => `- ${n}`).join("\n")
     : "(none yet)";
 
-  const prompt = `You are a content strategist for an autonomous Bluesky meme account in the software engineering space.
+  // Recall prior qualitative learnings from Mem0 (semantic, cross-cutting — e.g.
+  // timing effects) to inform today's synthesis. Best-effort: never blocks.
+  const priorLearnings = await recallStrategyLearnings(correlationId);
+  const priorLearningsBlock = priorLearnings.length > 0
+    ? priorLearnings.map((l) => `- ${l}`).join("\n")
+    : "(none yet)";
 
-Analyze the following engagement data from the last 14 days and provide updated content guidance.
+  const system = `You are a content strategist for an autonomous Bluesky meme account in the software engineering space.
 
-TOP PERFORMING POSTS (highest engagement scores):
+Analyze the engagement data in the user message (last 14 days) and provide updated content guidance.
+
+Provide:
+1. Up to 4 specific, actionable format notes (caption style, tone, length, structure, humor type) derived from what's actually working in the data
+2. An updated audience description (60 words max) — be specific about what this audience responds to; use the engagement data, not generic assumptions
+3. learnings: 0-3 short cross-cutting QUALITATIVE observations that don't fit a structured field — e.g. timing/day-of-week effects (note the day= field), topic fatigue, recurring patterns. Each under 20 words. Only genuinely data-supported ones; use [] if none. Do not repeat the prior learnings verbatim.
+
+Respond with ONLY valid JSON, no markdown:
+{
+  "formatNotes": ["...", "..."],
+  "audienceNotes": "...",
+  "learnings": ["...", "..."]
+}`;
+
+  const user = `TOP PERFORMING POSTS (highest engagement scores):
 ${topLines}
 
 LOWEST PERFORMING POSTS:
@@ -183,17 +189,10 @@ ${currentFormatNotes}
 
 CURRENT AUDIENCE NOTES: ${currentLog.audienceNotes || "(none yet)"}
 
-Provide:
-1. Up to 4 specific, actionable format notes (caption style, tone, length, structure, humor type) derived from what's actually working in the data above
-2. An updated audience description (60 words max) — be specific about what this audience responds to; use the engagement data, not generic assumptions
+PRIOR QUALITATIVE LEARNINGS (from long-term memory — use as context, don't just repeat):
+${priorLearningsBlock}`;
 
-Respond with ONLY valid JSON, no markdown:
-{
-  "formatNotes": ["...", "..."],
-  "audienceNotes": "..."
-}`;
-
-  return harnessedCall(
+  const result = await harnessedCall(
     {
       agentName: "analytics",
       action: "synthesize-strategy",
@@ -202,22 +201,17 @@ Respond with ONLY valid JSON, no markdown:
       skipCircuitBreaker: true,
     },
     async () => {
-      const ai = getGemini();
-      const response = await ai.models.generateContent({
-        model: "gemini-2.0-flash",
-        contents: prompt,
-      });
+      const text = await completeText({ system, user, maxTokens: 1024 });
 
-      const text = (response.text ?? "{}").trim();
       // Strip markdown code fences if model wraps response despite instructions
       const clean = text.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
 
-      let parsed: { formatNotes?: unknown; audienceNotes?: unknown };
+      let parsed: { formatNotes?: unknown; audienceNotes?: unknown; learnings?: unknown };
       try {
-        parsed = JSON.parse(clean) as { formatNotes?: unknown; audienceNotes?: unknown };
+        parsed = JSON.parse(clean) as { formatNotes?: unknown; audienceNotes?: unknown; learnings?: unknown };
       } catch {
-        console.warn("[analytics] synthesize-strategy: could not parse Gemini response, keeping existing notes");
-        return { formatNotes: currentLog.formatNotes, audienceNotes: currentLog.audienceNotes };
+        console.warn("[analytics] synthesize-strategy: could not parse model response, keeping existing notes");
+        return { formatNotes: currentLog.formatNotes, audienceNotes: currentLog.audienceNotes, learnings: [] as string[] };
       }
 
       const formatNotes = Array.isArray(parsed.formatNotes)
@@ -226,11 +220,56 @@ Respond with ONLY valid JSON, no markdown:
       const audienceNotes = typeof parsed.audienceNotes === "string"
         ? parsed.audienceNotes
         : currentLog.audienceNotes;
+      const learnings = Array.isArray(parsed.learnings)
+        ? (parsed.learnings as unknown[]).filter((l): l is string => typeof l === "string")
+        : [];
 
-      console.info(`[analytics] strategy updated: ${formatNotes.length} format notes, audience: "${audienceNotes.slice(0, 60)}..."`);
-      return { formatNotes, audienceNotes };
+      console.info(`[analytics] strategy updated: ${formatNotes.length} format notes, ${learnings.length} new learnings, audience: "${audienceNotes.slice(0, 60)}..."`);
+      return { formatNotes, audienceNotes, learnings };
     }
   );
+
+  // Persist the new qualitative learnings into Mem0 (best-effort, alongside the
+  // structured style log — §3.5). Never blocks the refresh.
+  await storeStrategyLearnings(result.learnings, correlationId);
+
+  return { formatNotes: result.formatNotes, audienceNotes: result.audienceNotes };
+}
+
+function weekday(d: Date): string {
+  return d.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" });
+}
+
+// Best-effort Mem0 recall, wrapped in the harness. Returns [] on any failure or
+// when Mem0 is disabled (no MEM0_API_KEY).
+async function recallStrategyLearnings(correlationId?: string): Promise<string[]> {
+  try {
+    return await harnessedCall(
+      { agentName: "analytics", action: "mem0-recall", input: { niche: NICHE }, correlationId, skipCircuitBreaker: true },
+      () => recallLearnings(`content strategy and engagement patterns for ${NICHE}`, 5)
+    );
+  } catch (err) {
+    console.warn("[analytics] mem0 recall failed:", err instanceof Error ? err.message : err);
+    return [];
+  }
+}
+
+// Best-effort Mem0 store, wrapped in the harness. Never throws.
+async function storeStrategyLearnings(learnings: string[], correlationId?: string): Promise<void> {
+  if (learnings.length === 0) return;
+  try {
+    await harnessedCall(
+      { agentName: "analytics", action: "mem0-store", input: { count: learnings.length }, correlationId, skipCircuitBreaker: true },
+      async () => {
+        for (const learning of learnings) {
+          await addLearning(learning, { source: "strategy-synthesis", niche: NICHE });
+        }
+      }
+    );
+    console.info(`[analytics] stored ${learnings.length} qualitative learnings to Mem0`);
+  } catch (err) {
+    console.warn("[analytics] mem0 store failed:", err instanceof Error ? err.message : err);
+  }
 }
 
 export async function processMetrics(
