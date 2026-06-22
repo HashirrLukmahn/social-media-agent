@@ -13,12 +13,14 @@
 
 import { harnessedCall } from "../harness/index.js";
 import { kvGet } from "../harness/store.js";
+import { getRecentTemplates } from "../harness/db.js";
+import { recallRecentTemplates, rememberPostedMeme } from "../shared/mem0.js";
 import { completeText } from "../shared/llm.js";
 import { getTemplates, renderMemegen } from "./memegen.js";
 import { renderMagicHour, isDepletedError } from "./magicHour.js";
 import { assertGenerationAllowed, recordGeneration, type GenerationType } from "../shared/generationCap.js";
 import type { FallbackMeme, GeneratedMeme, StyleLog } from "../shared/types.js";
-import { BLOCKED_TOPICS, SAFETY_CONSTRAINTS } from "../shared/constants.js";
+import { BLOCKED_TOPICS, DEFAULT_HASHTAGS, NICHE, SAFETY_CONSTRAINTS } from "../shared/constants.js";
 
 const STYLE_LOG_KEY = "style_log:today";
 const FALLBACK_BANK_KEY = "fallback_bank";
@@ -41,11 +43,42 @@ const TEMPLATE_HINTS: Record<string, string> = {
 };
 const ANCHOR_TEMPLATES = ["drake", "fine", "aag"];
 
+// How many recently-used templates to block, and the floor below which we stop
+// blocking so the menu can never collapse to nothing.
+const RECENT_TEMPLATE_WINDOW = 4;
+const MIN_TEMPLATE_CHOICES = 4;
+
 interface MemeSpec {
   template: string;
   topText: string;
   bottomText: string;
   caption: string;
+  // Short rationale for the template/joke choice + which inputs informed it.
+  reasoning: string;
+  // The specific style inputs the model says it drew on (themes/events/notes).
+  themesReferenced: string[];
+  // Topic-tailored hashtags (already normalized to start with #).
+  hashtags: string[];
+}
+
+// Normalizes model-supplied hashtags: coerce to strings, strip whitespace, ensure a
+// single leading #, drop empties/dupes, cap the count. Falls back to the defaults
+// when nothing usable comes back so a post is never tagless.
+function normalizeHashtags(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [...DEFAULT_HASHTAGS];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const tag = "#" + item.trim().replace(/^#+/, "").replace(/\s+/g, "");
+    if (tag.length <= 1) continue;
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+    if (out.length >= 5) break;
+  }
+  return out.length > 0 ? out : [...DEFAULT_HASHTAGS];
 }
 
 function styleContext(styleLog: StyleLog): string {
@@ -95,16 +128,34 @@ function selectTopic(styleLog: StyleLog): string {
 }
 
 // LLM pass: topic + style context → { template, topText, bottomText, caption }.
+// recentTemplates are removed from the menu entirely (a hard guard, not a soft hint)
+// so the model literally cannot pick a format it just used.
 async function generateMemeSpec(
   styleLog: StyleLog,
   topic: string,
   validTemplateIds: Set<string>,
+  recentTemplates: string[],
   correlationId?: string
 ): Promise<MemeSpec> {
-  const offered = Object.entries(TEMPLATE_HINTS).filter(([id]) => validTemplateIds.has(id));
+  const available = Object.entries(TEMPLATE_HINTS).filter(([id]) => validTemplateIds.has(id));
+  const recentSet = new Set(recentTemplates);
+
+  // Drop recently-used templates — but if that leaves too few, relax the guard so we
+  // always have a usable menu (e.g. catalog shrank or every template was just used).
+  const trimmed = available.filter(([id]) => !recentSet.has(id));
+  const offered = trimmed.length >= MIN_TEMPLATE_CHOICES ? trimmed : available;
+
+  // Only ids actually on the menu are valid picks (and valid fallbacks), so the guard
+  // can't be bypassed by the model returning a blocked id or the parser defaulting to one.
+  const allowedIds = new Set(offered.map(([id]) => id));
   const menu = offered.map(([id, hint]) => `- ${id}: ${hint}`).join("\n");
   const defaultTemplate =
     offered.find(([id]) => ANCHOR_TEMPLATES.includes(id))?.[0] ?? offered[0]?.[0] ?? "drake";
+
+  const avoidNote =
+    recentTemplates.length > 0
+      ? `\n\nRecently used templates (already excluded from the menu — do NOT ask for them): ${recentTemplates.join(", ")}. Vary the format.`
+      : "";
 
   const system = `You write a single software-engineering humor meme for a Bluesky audience. Pick ONE meme template from the menu whose structure best fits the joke, write the on-image text, and a separate short Bluesky caption.
 
@@ -112,14 +163,17 @@ ${SAFETY_CONSTRAINTS}
 
 Rules:
 - topText / bottomText are the words ON the image. Keep each short and punchy. If the template only needs one line, put it in topText and leave bottomText empty.
-- caption is the Bluesky post text that accompanies the image — one relatable line, no hashtags (those are added later).
+- caption is the Bluesky post text that accompanies the image — one relatable line, no hashtags (those go in the hashtags field).
 - Style: dry, absurdist, or relatable-pain humor. Let the image carry the setup.
+- reasoning: 1-2 sentences on why this template's structure fits the joke. Prefer a template that suits the joke over always reaching for the same one.
+- themesReferenced: list the specific inputs you actually drew on for this meme (e.g. a trending theme, a current event, an audience or format note). Use [] if you only used the base topic. Quote the input briefly, do not invent new ones.
+- hashtags: 3-5 Bluesky hashtags tailored to THIS meme's topic and themes (each starts with #, no spaces). Mix one or two broad discovery tags with more specific ones tied to the joke.
 
 Respond with ONLY valid JSON, no markdown:
-{ "template": "<one id from the menu>", "topText": "...", "bottomText": "...", "caption": "..." }`;
+{ "template": "<one id from the menu>", "topText": "...", "bottomText": "...", "caption": "...", "reasoning": "...", "themesReferenced": ["..."], "hashtags": ["#..."] }`;
 
   const user = `Topic: ${topic}
-Niche: ${styleLog.niche}${styleContext(styleLog)}
+Niche: ${styleLog.niche}${styleContext(styleLog)}${avoidNote}
 
 Template menu (choose the id whose structure fits the joke best):
 ${menu}`;
@@ -127,7 +181,15 @@ ${menu}`;
   const text = await completeText({ system, user, maxTokens: 512 });
   const clean = text.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
 
-  let parsed: { template?: unknown; topText?: unknown; bottomText?: unknown; caption?: unknown };
+  let parsed: {
+    template?: unknown;
+    topText?: unknown;
+    bottomText?: unknown;
+    caption?: unknown;
+    reasoning?: unknown;
+    themesReferenced?: unknown;
+    hashtags?: unknown;
+  };
   try {
     parsed = JSON.parse(clean) as typeof parsed;
   } catch {
@@ -135,14 +197,19 @@ ${menu}`;
     parsed = {};
   }
 
-  const template = typeof parsed.template === "string" && validTemplateIds.has(parsed.template)
+  const template = typeof parsed.template === "string" && allowedIds.has(parsed.template)
     ? parsed.template
     : defaultTemplate;
   const topText = typeof parsed.topText === "string" ? parsed.topText : topic;
   const bottomText = typeof parsed.bottomText === "string" ? parsed.bottomText : "";
   const caption = typeof parsed.caption === "string" && parsed.caption.length > 0 ? parsed.caption : topic;
+  const reasoning = typeof parsed.reasoning === "string" ? parsed.reasoning : "";
+  const themesReferenced = Array.isArray(parsed.themesReferenced)
+    ? parsed.themesReferenced.filter((t): t is string => typeof t === "string" && t.trim().length > 0)
+    : [];
+  const hashtags = normalizeHashtags(parsed.hashtags);
 
-  return { template, topText, bottomText, caption };
+  return { template, topText, bottomText, caption, reasoning, themesReferenced, hashtags };
 }
 
 export async function getFallbackMeme(): Promise<GeneratedMeme | null> {
@@ -158,6 +225,9 @@ export async function getFallbackMeme(): Promise<GeneratedMeme | null> {
     templateUsed: "fallback",
     generator: "fallback",
     topic: "fallback",
+    reasoning: "Served from the approved fallback bank — live generation was unavailable.",
+    themesReferenced: [],
+    hashtags: [...DEFAULT_HASHTAGS],
   };
 }
 
@@ -168,6 +238,28 @@ export interface GenerateOptions {
   // Only honored for exploratory generations: route to Magic Hour (novel format /
   // doesn't fit a Memegen template). Ignored for mandatory — those never hit Magic Hour.
   preferMagicHour?: boolean;
+}
+
+// Recently-used templates the next meme should avoid. Mem0 is the source of truth
+// (the agent's own persistent memory); Postgres is the fallback when Mem0 is disabled
+// or empty. Best-effort throughout — the guard is an optimization, never a blocker.
+async function loadRecentTemplates(correlationId?: string): Promise<string[]> {
+  try {
+    const fromMem0 = await harnessedCall(
+      { agentName: "meme-generator", action: "mem0-recall-templates", input: {}, correlationId, skipCircuitBreaker: true },
+      () => recallRecentTemplates(RECENT_TEMPLATE_WINDOW)
+    );
+    if (fromMem0.length > 0) return fromMem0;
+  } catch (err) {
+    console.warn("[meme-generator] mem0 template recall failed, falling back to DB:", err instanceof Error ? err.message : err);
+  }
+
+  try {
+    return await getRecentTemplates(NICHE, RECENT_TEMPLATE_WINDOW);
+  } catch (err) {
+    console.warn("[meme-generator] DB template recall failed — no recency guard this run:", err instanceof Error ? err.message : err);
+    return [];
+  }
 }
 
 export async function generateMeme(
@@ -191,6 +283,12 @@ export async function generateMeme(
   // is reached (caller decides whether to skip).
   await assertGenerationAllowed(type);
 
+  // Pull the recently-used templates so the generator can avoid repeating formats.
+  const recentTemplates = await loadRecentTemplates(correlationId);
+  if (recentTemplates.length > 0) {
+    console.info(`[meme-generator] avoiding recently-used templates: ${recentTemplates.join(", ")}`);
+  }
+
   try {
     const templates = await getTemplates();
     const spec = await harnessedCall(
@@ -202,7 +300,7 @@ export async function generateMeme(
         attempts: 3,
         baseDelayMs: 1000,
       },
-      () => generateMemeSpec(styleLog, topic, new Set(templates.keys()), correlationId)
+      () => generateMemeSpec(styleLog, topic, new Set(templates.keys()), recentTemplates, correlationId)
     );
 
     // Magic Hour is reachable ONLY for exploratory slots that opt in. Mandatory
@@ -241,7 +339,16 @@ export async function generateMeme(
 
     await recordGeneration();
 
-    return { imageUrl, caption: spec.caption, templateUsed: spec.template, generator, topic };
+    return {
+      imageUrl,
+      caption: spec.caption,
+      templateUsed: spec.template,
+      generator,
+      topic,
+      reasoning: spec.reasoning,
+      themesReferenced: spec.themesReferenced,
+      hashtags: spec.hashtags,
+    };
   } catch (err) {
     console.warn("[meme-generator] generation failed, attempting fallback bank:", err instanceof Error ? err.message : err);
     const fallback = await getFallbackMeme();

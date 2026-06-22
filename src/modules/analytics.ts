@@ -145,12 +145,21 @@ export async function synthesizeStrategy(
   const top = sorted.slice(0, 5);
   const bottom = sorted.slice(-3);
 
-  const topLines = top
-    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} day=${weekday(r.generatedAt)} caption="${r.caption.slice(0, 80)}"`)
-    .join("\n");
-  const bottomLines = bottom
-    .map((r) => `- topic="${r.topic}" score=${r.score?.toFixed(2)} day=${weekday(r.generatedAt)} caption="${r.caption.slice(0, 80)}"`)
-    .join("\n");
+  const fmt = (r: typeof scoredRecords[number]): string =>
+    `- topic="${r.topic}" template=${r.templateUsed ?? "?"} score=${r.score?.toFixed(2)} day=${weekday(r.generatedAt)} caption="${r.caption.slice(0, 80)}"`;
+  const topLines = top.map(fmt).join("\n");
+  const bottomLines = bottom.map(fmt).join("\n");
+
+  // Format usage distribution so the model can flag over-used templates explicitly.
+  const templateCounts = new Map<string, number>();
+  for (const r of scoredRecords) {
+    const t = r.templateUsed ?? "unknown";
+    templateCounts.set(t, (templateCounts.get(t) ?? 0) + 1);
+  }
+  const templateUsage = [...templateCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([t, n]) => `${t} (${n})`)
+    .join(", ");
   const currentFormatNotes = currentLog.formatNotes.length > 0
     ? currentLog.formatNotes.map((n) => `- ${n}`).join("\n")
     : "(none yet)";
@@ -166,10 +175,12 @@ export async function synthesizeStrategy(
 
 Analyze the engagement data in the user message (last 14 days) and provide updated content guidance.
 
+Each post lists its meme template (template=) — factor format into your analysis, not just topic.
+
 Provide:
-1. Up to 4 specific, actionable format notes (caption style, tone, length, structure, humor type) derived from what's actually working in the data
+1. Up to 4 specific, actionable format notes (caption style, tone, length, structure, humor type, AND which meme templates to use or avoid) derived from what's actually working in the data. If one template is over-used relative to its results, say so explicitly and suggest alternatives.
 2. An updated audience description (60 words max) — be specific about what this audience responds to; use the engagement data, not generic assumptions
-3. learnings: 0-3 short cross-cutting QUALITATIVE observations that don't fit a structured field — e.g. timing/day-of-week effects (note the day= field), topic fatigue, recurring patterns. Each under 20 words. Only genuinely data-supported ones; use [] if none. Do not repeat the prior learnings verbatim.
+3. learnings: 0-3 short cross-cutting QUALITATIVE observations that don't fit a structured field — e.g. timing/day-of-week effects (note the day= field), template fatigue or which formats land, topic fatigue, recurring patterns. Each under 20 words. Only genuinely data-supported ones; use [] if none. Do not repeat the prior learnings verbatim.
 
 Respond with ONLY valid JSON, no markdown:
 {
@@ -178,7 +189,10 @@ Respond with ONLY valid JSON, no markdown:
   "learnings": ["...", "..."]
 }`;
 
-  const user = `TOP PERFORMING POSTS (highest engagement scores):
+  const user = `TEMPLATE USAGE (last 14 days, count per template — watch for over-reliance):
+${templateUsage || "(none)"}
+
+TOP PERFORMING POSTS (highest engagement scores):
 ${topLines}
 
 LOWEST PERFORMING POSTS:

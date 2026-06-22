@@ -18,6 +18,9 @@ import { MemoryClient, type Message, type AddMemoryOptions } from "mem0ai";
 import { NICHE } from "./constants.js";
 
 const MEM0_USER_ID = `analytics:${NICHE}`;
+// Separate namespace for the per-meme posting log so a recall of "what did I post"
+// never gets mixed in with the qualitative strategy learnings above.
+const MEME_LOG_USER_ID = `memes:${NICHE}`;
 
 let client: MemoryClient | null = null;
 let disabled = false;
@@ -61,4 +64,57 @@ export async function recallLearnings(query: string, limit = 5): Promise<string[
   return results
     .map((m) => m.memory)
     .filter((m): m is string => typeof m === "string" && m.length > 0);
+}
+
+// Record that a meme with the given template was posted. Persists the template in
+// metadata so recall is exact (no parsing free text). No-op when Mem0 is disabled;
+// throws on API error (caller wraps in harnessedCall and tolerates failure).
+export async function rememberPostedMeme(
+  template: string,
+  topic: string,
+  date = new Date().toISOString().slice(0, 10)
+): Promise<void> {
+  const c = getClient();
+  if (!c) return;
+  const messages: Message[] = [
+    { role: "assistant", content: `Posted a meme using the "${template}" template (topic: ${topic}) on ${date}.` },
+  ];
+  await c.add(messages, {
+    userId: MEME_LOG_USER_ID,
+    infer: false, // store the record verbatim, don't re-derive facts
+    metadata: { kind: "meme-post", template, topic, date },
+  });
+}
+
+// Recall the templates used by the most recently posted memes, newest first and
+// de-duplicated. Reads the template from each memory's metadata and orders by
+// createdAt. Returns [] when Mem0 is disabled; throws on API error.
+export async function recallRecentTemplates(limit = 8): Promise<string[]> {
+  const c = getClient();
+  if (!c) return [];
+  // A stable query is fine — the user_id filter already scopes to the meme log; we
+  // pull a generous topK and order by recency ourselves.
+  const { results } = await c.search("meme templates recently posted", {
+    filters: { user_id: MEME_LOG_USER_ID },
+    topK: Math.max(limit * 3, 20),
+  });
+
+  const withTime = results
+    .map((m) => ({
+      template: (m.metadata as { template?: unknown } | null | undefined)?.template,
+      createdAt: m.createdAt ? new Date(m.createdAt).getTime() : 0,
+    }))
+    .filter((r): r is { template: string; createdAt: number } => typeof r.template === "string");
+
+  withTime.sort((a, b) => b.createdAt - a.createdAt);
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of withTime) {
+    if (seen.has(r.template)) continue;
+    seen.add(r.template);
+    out.push(r.template);
+    if (out.length >= limit) break;
+  }
+  return out;
 }

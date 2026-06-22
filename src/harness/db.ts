@@ -125,6 +125,31 @@ export async function getRecentPostRecords(
     .orderBy(desc(schema.postRecords.generatedAt));
 }
 
+// Distinct templates used by the most recent posts, newest first. Powers the
+// meme generator's "don't repeat the last few formats" guard. Skips null templates
+// (rows written before the column existed) and dedupes while preserving recency.
+export async function getRecentTemplates(
+  niche: string,
+  limit = 8
+): Promise<string[]> {
+  const rows = await getDb()
+    .select({ templateUsed: schema.postRecords.templateUsed })
+    .from(schema.postRecords)
+    .where(eq(schema.postRecords.niche, niche))
+    .orderBy(desc(schema.postRecords.generatedAt))
+    .limit(limit);
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of rows) {
+    const t = r.templateUsed;
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
 export async function getPostMetricsForRecord(
   slotId: string
 ): Promise<(typeof schema.postMetrics.$inferSelect)[]> {

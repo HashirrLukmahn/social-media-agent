@@ -62,6 +62,15 @@ export interface GeneratedMeme {
   // Which path produced this meme — replaces the old creditsUsed count.
   generator: "memegen" | "magichour" | "fallback";
   topic: string;
+  // Why the agent chose this template/joke (1-2 sentences). Surfaced to Slack on
+  // post so a human can see the reasoning and spot when formats get repetitive.
+  reasoning: string;
+  // The specific style inputs the agent drew on (trending themes, current events,
+  // audience/format notes). Empty when it leaned only on the base topic.
+  themesReferenced: string[];
+  // Topic-tailored hashtags chosen for this post. Falls back to DEFAULT_HASHTAGS
+  // when the model returns none.
+  hashtags: string[];
 }
 
 export interface RawEngagementMetrics {

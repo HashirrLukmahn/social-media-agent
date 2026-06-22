@@ -12,6 +12,9 @@ export const postRecords = pgTable("post_records", {
   slotId: text("slot_id").primaryKey(),
   niche: text("niche").notNull(),
   topic: text("topic").notNull(),
+  // Memegen template id (or "fallback"/"magichour") used for this post. Nullable for
+  // rows written before this column existed. Read back to avoid repeating formats.
+  templateUsed: text("template_used"),
   imageUrl: text("image_url").notNull(),
   caption: text("caption").notNull(),
   status: text("status").notNull(), // 'generated' | 'posted' | 'skipped'

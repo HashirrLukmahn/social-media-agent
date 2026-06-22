@@ -28,7 +28,14 @@ vi.mock("redis", () => ({ createClient: vi.fn(() => mockRedisClient) }));
 vi.mock("../../harness/db.js", () => ({
   insertRunLogEntry: vi.fn().mockResolvedValue(undefined),
   getRecentRunLog: vi.fn().mockResolvedValue([]),
+  getRecentTemplates: vi.fn().mockResolvedValue([]),
   _resetDbForTesting: vi.fn(),
+}));
+
+// Mem0 — disabled in tests; recall returns nothing, remember is a no-op.
+vi.mock("../../shared/mem0.js", () => ({
+  recallRecentTemplates: vi.fn().mockResolvedValue([]),
+  rememberPostedMeme: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Claude meme-spec call — return a canned spec.

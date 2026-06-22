@@ -10,6 +10,8 @@ import {
   insertScheduledJob,
   getRecentPostRecords,
 } from "../harness/db.js";
+import { notifyMemePosted } from "../harness/alert.js";
+import { rememberPostedMeme } from "../shared/mem0.js";
 import { DEFAULT_HASHTAGS, MAX_REPLIES_PER_CYCLE, NICHE } from "../shared/constants.js";
 import type { GeneratedMeme, RawEngagementMetrics } from "../shared/types.js";
 
@@ -41,7 +43,10 @@ async function postBluesky(
     async () => {
       const agent = await getBskyAgent();
 
-      const fullText = [meme.caption, DEFAULT_HASHTAGS.join(" ")].join("\n\n");
+      // Prefer the topic-tailored hashtags the generator produced; fall back to the
+      // static defaults if the model returned none.
+      const hashtags = meme.hashtags.length > 0 ? meme.hashtags : [...DEFAULT_HASHTAGS];
+      const fullText = [meme.caption, hashtags.join(" ")].join("\n\n");
       const rt = new RichText({ text: fullText });
       await rt.detectFacets(agent);
 
@@ -179,6 +184,7 @@ export async function postMemeToSlot(
     slotId,
     niche: NICHE,
     topic: meme.topic,
+    templateUsed: meme.templateUsed,
     imageUrl: meme.imageUrl,
     caption: meme.caption,
     status: "generated",
@@ -193,6 +199,19 @@ export async function postMemeToSlot(
   });
 
   console.info(`[social-media] posted slot ${slotId} → ${blueskyUri}`);
+
+  // Surface the agent's reasoning + the info/themes/hashtags it used to Slack.
+  // Best-effort: notifyMemePosted never throws, but guard anyway so a Slack hiccup
+  // can't undo a successful post.
+  await notifyMemePosted(meme, blueskyUri).catch((err) => {
+    console.warn("[social-media] post notification failed:", err instanceof Error ? err.message : err);
+  });
+
+  // Persist this post to Mem0 so the next generation remembers which template was
+  // used and avoids repeating it. Best-effort: a Mem0 outage must not fail the post.
+  await rememberPostedMeme(meme.templateUsed, meme.topic).catch((err) => {
+    console.warn("[social-media] mem0 remember-post failed:", err instanceof Error ? err.message : err);
+  });
 
   await scheduleEngagementPolls(blueskyUri, slotId, correlationId);
 
