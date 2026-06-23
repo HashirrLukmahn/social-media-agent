@@ -15,6 +15,10 @@ export const postRecords = pgTable("post_records", {
   // Memegen template id (or "fallback"/"magichour") used for this post. Nullable for
   // rows written before this column existed. Read back to avoid repeating formats.
   templateUsed: text("template_used"),
+  // Which generation path produced this post: 'memegen' | 'magichour' | 'fallback'.
+  // Nullable for rows written before this column existed. Read back by the daily
+  // posting-plan analysis to compare generator performance.
+  generator: text("generator"),
   imageUrl: text("image_url").notNull(),
   caption: text("caption").notNull(),
   status: text("status").notNull(), // 'generated' | 'posted' | 'skipped'

@@ -16,6 +16,7 @@ import { runDailyRefresh } from "./shared/dailyRefresh.js";
 import { runSafetyChain } from "./modules/safetyReview.js";
 import { postMemeToSlot, pollEngagement } from "./modules/socialMedia.js";
 import { processMetrics } from "./modules/analytics.js";
+import { getPostingPlan } from "./shared/postingPlan.js";
 import { POSTING_WINDOWS } from "./shared/constants.js";
 import type { PostingSlot } from "./shared/types.js";
 
@@ -44,20 +45,28 @@ function randomTimeInWindow(
   return new Date(dayStartUtc.getTime() + openMs + offsetMs);
 }
 
-function buildTodaySchedule(): PostingSlot[] {
+// Builds today's slots from the active posting plan. A window can yield multiple
+// slots (the "double-up" layout: a Memegen post AND a Magic Hour post), each with its
+// own random time within the window, generator, and unique slot id.
+async function buildTodaySchedule(): Promise<PostingSlot[]> {
   const today = new Date();
-  return POSTING_WINDOWS.map((w, i) => {
-    const scheduledAt = randomTimeInWindow(w.openH, w.openM, w.closeH, w.closeM, today);
-    const windowIndex = i as 0 | 1 | 2;
-    const dateStr = today.toISOString().slice(0, 10);
-    const slotId = `${dateStr}:w${windowIndex}`;
-    return {
-      slotId,
-      windowIndex,
-      scheduledAt,
-      correlationId: uuidv4(),
-    };
+  const dateStr = today.toISOString().slice(0, 10);
+  const plan = await getPostingPlan();
+
+  const slots: PostingSlot[] = [];
+  POSTING_WINDOWS.forEach((w, i) => {
+    const generators = plan.generatorsByWindow[i] ?? [];
+    generators.forEach((generator, j) => {
+      slots.push({
+        slotId: `${dateStr}:w${i}:p${j}`,
+        windowIndex: i as 0 | 1 | 2,
+        generator,
+        scheduledAt: randomTimeInWindow(w.openH, w.openM, w.closeH, w.closeM, today),
+        correlationId: uuidv4(),
+      });
+    });
   });
+  return slots;
 }
 
 // Uses a persistent Redis key so the refresh survives process restarts correctly.
@@ -78,11 +87,11 @@ async function maybeRunDailyRefresh(): Promise<void> {
 }
 
 async function runFullPostingCycle(slot: PostingSlot): Promise<void> {
-  const { slotId, correlationId } = slot;
-  console.info(`[scheduler] running posting cycle for slot ${slotId} corr=${correlationId}`);
+  const { slotId, correlationId, generator } = slot;
+  console.info(`[scheduler] running posting cycle for slot ${slotId} (${generator}) corr=${correlationId}`);
 
   try {
-    const meme = await runSafetyChain(slotId, correlationId);
+    const meme = await runSafetyChain(slotId, correlationId, generator);
     await postMemeToSlot(slotId, meme, correlationId);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -143,11 +152,11 @@ export async function startScheduler(): Promise<never> {
   console.info("[scheduler] starting...");
   await maybeRunDailyRefresh();
 
-  let todaySchedule = buildTodaySchedule();
+  let todaySchedule = await buildTodaySchedule();
   const firedSlots = new Set<string>();
 
   console.info(
-    `[scheduler] today's slots: ${todaySchedule.map((s) => `${s.slotId}@${s.scheduledAt.toISOString()}`).join(", ")}`
+    `[scheduler] today's slots: ${todaySchedule.map((s) => `${s.slotId}(${s.generator})@${s.scheduledAt.toISOString()}`).join(", ")}`
   );
 
   setInterval(async () => {
@@ -160,10 +169,10 @@ export async function startScheduler(): Promise<never> {
       // Rebuild schedule at day boundary
       if (currentDay !== todaySchedule[0]?.slotId.slice(0, 10)) {
         await maybeRunDailyRefresh();
-        todaySchedule = buildTodaySchedule();
+        todaySchedule = await buildTodaySchedule();
         firedSlots.clear();
         console.info(
-          `[scheduler] new day ${currentDay}, rebuilt schedule: ${todaySchedule.map((s) => `${s.slotId}@${s.scheduledAt.toISOString()}`).join(", ")}`
+          `[scheduler] new day ${currentDay}, rebuilt schedule: ${todaySchedule.map((s) => `${s.slotId}(${s.generator})@${s.scheduledAt.toISOString()}`).join(", ")}`
         );
       }
 

@@ -6,7 +6,7 @@ import { harnessedCall } from "../harness/index.js";
 import { completeText } from "../shared/llm.js";
 import { insertTakedown } from "../harness/db.js";
 import { generateMeme, getFallbackMeme } from "./memeGenerator.js";
-import type { GeneratedMeme } from "../shared/types.js";
+import type { GeneratedMeme, Generator } from "../shared/types.js";
 
 const SAFETY_REVIEW_PROMPT = `You are a content safety reviewer for a software engineering meme account on Bluesky.
 The account is run by an AI and the audience is professional software developers.
@@ -71,9 +71,10 @@ export async function reviewSafety(
 //   4. If fallback bank empty → throw (slot must be skipped, never post unreviewed content)
 export async function runSafetyChain(
   slotId: string,
-  correlationId?: string
+  correlationId?: string,
+  generator: Generator = "memegen"
 ): Promise<GeneratedMeme> {
-  let meme = await generateMeme(slotId, correlationId);
+  let meme = await generateMeme(slotId, correlationId, { generator });
   let review = await reviewSafety(meme, correlationId);
 
   if (review.status === "SAFE") return meme;
@@ -81,7 +82,7 @@ export async function runSafetyChain(
   console.warn(`[safety-review] first generation FLAGGED (${review.reason}) — retrying with conservative prompt`);
 
   try {
-    meme = await generateMeme(`${slotId}:conservative`, correlationId);
+    meme = await generateMeme(`${slotId}:conservative`, correlationId, { generator });
     review = await reviewSafety(meme, correlationId);
     if (review.status === "SAFE") return meme;
   } catch (err) {

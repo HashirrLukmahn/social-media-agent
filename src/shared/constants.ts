@@ -24,11 +24,33 @@ export const POSTING_WINDOWS: ReadonlyArray<{ openH: number; openM: number; clos
 ];
 
 // Daily generation pacing cap (§4 — replaces the old Memelord credit budget).
-// Memegen.link is free and Magic Hour is exploratory-only, so this is a simple
-// self-imposed count, not a spend budget. 3 mandatory (one per scheduled post)
-// + up to 5 exploratory = 8 generations/day max.
-export const MANDATORY_GENERATIONS = 3;
+// Memegen.link is free and Magic Hour is paid (limited free balance), so this is a
+// self-imposed count, not a spend budget. The mandatory count now tracks the number
+// of scheduled posts in the active posting plan (default 5: 3 Memegen + 2 Magic Hour);
+// the daily refresh derives it from the plan. EXPLORATORY remains the extra creative
+// budget on top of the scheduled posts.
+export const MANDATORY_GENERATIONS = 5;
 export const EXPLORATORY_GENERATIONS = 5;
+
+// ── Posting plan (generator mix per window) ──────────────────────────────────
+// The default daily layout: each inner array is the posts to make in POSTING_WINDOWS
+// of the same index. Windows 0 & 1 "double up" a free Memegen post and a paid Magic
+// Hour post; window 2 posts Memegen only → 3 Memegen + 2 Magic Hour per day.
+export const DEFAULT_POSTING_PLAN: ReadonlyArray<ReadonlyArray<"memegen" | "magichour">> = [
+  ["memegen", "magichour"],
+  ["memegen", "magichour"],
+  ["memegen"],
+];
+
+// Guardrails on the daily (full-autonomy) plan rewrite, so a bad model response can
+// never break posting or run up the Magic Hour bill.
+export const POSTING_PLAN_MIN_POSTS = 3;  // never post fewer than this per day
+export const POSTING_PLAN_MAX_POSTS = 6;  // never post more than this per day
+export const POSTING_PLAN_MAX_PER_WINDOW = 2; // at most a double-up per window
+export const MAGICHOUR_MAX_PER_DAY = 3;   // cost guard on the paid generator
+// Minimum number of scored posts before the daily analysis will deviate from the
+// current plan — below this the signal is too noisy to rebalance the generator mix.
+export const POSTING_PLAN_MIN_SCORED = 6;
 
 // Bluesky hashtags for discovery. Tune based on style log engagement data.
 export const DEFAULT_HASHTAGS = ["#softwareengineering", "#devhumor", "#buildinpublic"] as const;

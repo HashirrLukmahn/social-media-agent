@@ -89,9 +89,28 @@ export interface RawEngagementMetrics {
   blueskyUri: string;
 }
 
+// Which generation path a scheduled post should use. "fallback" is not schedulable —
+// it's only ever a runtime degradation of one of these two.
+export type Generator = "memegen" | "magichour";
+
 export interface PostingSlot {
   slotId: string;
   windowIndex: 0 | 1 | 2;
+  // The generator this specific post should use. A window may have multiple slots
+  // (e.g. a Memegen post AND a Magic Hour post — the "double-up" layout).
+  generator: Generator;
   scheduledAt: Date;
   correlationId: string;
+}
+
+// Persistent Redis key: "posting_plan" (no TTL). Rewritten daily by the analytics
+// posting-plan synthesis (full autonomy) and read by the scheduler when it builds
+// each day's schedule. generatorsByWindow[i] is the ordered list of posts to make in
+// POSTING_WINDOWS[i] — one entry per post, naming its generator. An empty inner array
+// means that window is skipped that day. Default layout: 3 Memegen + 2 Magic Hour.
+export interface PostingPlan {
+  generatorsByWindow: Generator[][];
+  // 1-2 sentence explanation of why the analysis chose this layout — for observability.
+  rationale: string;
+  updatedAt: string;
 }

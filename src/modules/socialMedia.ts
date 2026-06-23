@@ -433,43 +433,54 @@ async function runLikePass(
   console.info(`[social-media] like pass complete — ${likedCount} new likes this cycle`);
 }
 
-// Entry point for the per-cycle growth pass. One shared hashtag search, reused for
-// both the follow and like passes (§ rate-limit note: search once, use twice).
+// Entry point for the per-cycle growth pass. Bluesky's searchPosts does NOT support
+// boolean OR — an OR-joined query (e.g. "#a OR #b") matches zero posts. So we search
+// each niche hashtag separately and merge the results, de-duping by post URI so a
+// post that surfaces under multiple tags is counted once. The merged set feeds both
+// the follow and like passes.
 export async function runEngagementGrowthPass(correlationId?: string): Promise<void> {
   const botHandle = process.env["BSKY_HANDLE"];
-  const query = NICHE_HASHTAGS.join(" OR ");
 
-  let posts: SearchPost[];
-  try {
-    posts = await harnessedCall(
-      {
-        agentName: "social-media",
-        action: "growth-hashtag-search",
-        input: { query },
-        correlationId,
-        skipCircuitBreaker: true,
-      },
-      async () => {
-        const agent = await getBskyAgent();
-        const { data } = await agent.app.bsky.feed.searchPosts({
-          q: query,
-          limit: 100,
-          sort: "latest",
-        });
-        return data.posts
-          .map(normalizeSearchPost)
-          .filter((p): p is SearchPost => p !== null);
+  const byUri = new Map<string, SearchPost>();
+  for (const hashtag of NICHE_HASHTAGS) {
+    try {
+      const found = await harnessedCall(
+        {
+          agentName: "social-media",
+          action: "growth-hashtag-search",
+          input: { hashtag },
+          correlationId,
+          skipCircuitBreaker: true,
+        },
+        async () => {
+          const agent = await getBskyAgent();
+          const { data } = await agent.app.bsky.feed.searchPosts({
+            q: hashtag,
+            limit: 100,
+            sort: "latest",
+          });
+          return data.posts
+            .map(normalizeSearchPost)
+            .filter((p): p is SearchPost => p !== null);
+        }
+      );
+      for (const post of found) {
+        if (!byUri.has(post.uri)) byUri.set(post.uri, post);
       }
-    );
-  } catch (err) {
-    console.warn("[social-media] growth hashtag search failed — skipping growth pass:", err instanceof Error ? err.message : err);
-    return;
+    } catch (err) {
+      // One hashtag's search failing must never abort the whole growth pass.
+      console.warn(`[social-media] growth search failed for ${hashtag} — continuing:`, err instanceof Error ? err.message : err);
+    }
   }
+
+  const posts = [...byUri.values()];
+  console.info(`[social-media] growth pass: ${posts.length} unique posts across ${NICHE_HASHTAGS.length} hashtags`);
+  if (posts.length === 0) return; // nothing surfaced — both passes would no-op
 
   const agent = await getBskyAgent().catch(() => null);
   const botDid = agent?.session?.did ?? "";
 
-  // Follow pass then like pass — both read from the same `posts`, no second search.
+  // Follow pass then like pass — both read from the same merged `posts`, no re-search.
   await runFollowPass(posts, botDid, botHandle, correlationId).catch((err) => {
     console.warn("[social-media] follow pass errored:", err instanceof Error ? err.message : err);
   });
@@ -497,6 +508,7 @@ export async function postMemeToSlot(
     niche: NICHE,
     topic: meme.topic,
     templateUsed: meme.templateUsed,
+    generator: meme.generator,
     imageUrl: meme.imageUrl,
     caption: meme.caption,
     status: "generated",

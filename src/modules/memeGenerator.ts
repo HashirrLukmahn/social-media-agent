@@ -19,7 +19,7 @@ import { completeText, GENERATION_MODEL } from "../shared/llm.js";
 import { getTemplates, renderMemegen } from "./memegen.js";
 import { renderMagicHour, isDepletedError } from "./magicHour.js";
 import { assertGenerationAllowed, recordGeneration, type GenerationType } from "../shared/generationCap.js";
-import type { FallbackMeme, GeneratedMeme, StyleLog } from "../shared/types.js";
+import type { FallbackMeme, GeneratedMeme, Generator, StyleLog } from "../shared/types.js";
 import { BLOCKED_TOPICS, DEFAULT_HASHTAGS, NICHE, SAFETY_CONSTRAINTS } from "../shared/constants.js";
 
 const STYLE_LOG_KEY = "style_log:today";
@@ -238,11 +238,14 @@ export async function getFallbackMeme(): Promise<GeneratedMeme | null> {
 }
 
 export interface GenerateOptions {
-  // "mandatory" = one of the 3 scheduled posts (Memegen.link only). "exploratory"
-  // = a creative/test generation, eligible for Magic Hour. Defaults to mandatory.
+  // "mandatory" = a scheduled post (always allowed past the pacing cap). "exploratory"
+  // = a creative/test generation, capped per day. Defaults to mandatory.
   type?: GenerationType;
-  // Only honored for exploratory generations: route to Magic Hour (novel format /
-  // doesn't fit a Memegen template). Ignored for mandatory — those never hit Magic Hour.
+  // Which generation path to use for THIS post. "magichour" routes to Magic Hour and
+  // falls back to Memegen.link if the balance is depleted; "memegen" (default) uses
+  // Memegen.link directly. The scheduler sets this per slot from the posting plan.
+  generator?: Generator;
+  // Legacy/back-compat alias for exploratory callers: equivalent to generator:"magichour".
   preferMagicHour?: boolean;
 }
 
@@ -309,9 +312,10 @@ export async function generateMeme(
       () => generateMemeSpec(styleLog, topic, new Set(templates.keys()), recentTemplates, correlationId)
     );
 
-    // Magic Hour is reachable ONLY for exploratory slots that opt in. Mandatory
-    // posts can never reach it, regardless of preferMagicHour.
-    const useMagicHour = type === "exploratory" && options?.preferMagicHour === true;
+    // Route to Magic Hour when the slot asks for it (generator:"magichour", or the
+    // legacy preferMagicHour flag). Both scheduled and exploratory posts may use it;
+    // it degrades to Memegen.link below if the balance is depleted.
+    const useMagicHour = options?.generator === "magichour" || options?.preferMagicHour === true;
 
     let imageUrl: string;
     let generator: GeneratedMeme["generator"];
@@ -348,7 +352,10 @@ export async function generateMeme(
     return {
       imageUrl,
       caption: spec.caption,
-      templateUsed: spec.template,
+      // Magic Hour picks its own image internally, so the Memegen template id doesn't
+      // describe the post — record "magichour" to keep template stats clean. A Magic
+      // Hour slot that fell back to Memegen records the actual Memegen template.
+      templateUsed: generator === "magichour" ? "magichour" : spec.template,
       generator,
       topic,
       reasoning: spec.reasoning,

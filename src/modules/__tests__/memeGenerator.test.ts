@@ -114,13 +114,16 @@ describe("generateMeme — generator routing", () => {
     expect(renderMagicHour).not.toHaveBeenCalled();
   });
 
-  it("mandatory post ignores preferMagicHour (never reaches Magic Hour)", async () => {
-    const meme = await generateMeme("slot-2", "corr-2", { type: "mandatory", preferMagicHour: true });
-    expect(meme.generator).toBe("memegen");
-    expect(renderMagicHour).not.toHaveBeenCalled();
+  it("scheduled post with generator:magichour routes to Magic Hour", async () => {
+    // The 2 Magic Hour posts are scheduled (type defaults to mandatory) but explicitly
+    // request the Magic Hour generator via the posting plan.
+    const meme = await generateMeme("slot-2", "corr-2", { generator: "magichour" });
+    expect(meme.generator).toBe("magichour");
+    expect(meme.imageUrl).toContain("magichour.ai");
+    expect(renderMagicHour).toHaveBeenCalledOnce();
   });
 
-  it("exploratory + preferMagicHour routes to Magic Hour", async () => {
+  it("exploratory + preferMagicHour routes to Magic Hour (back-compat)", async () => {
     const meme = await generateMeme("slot-3", "corr-3", { type: "exploratory", preferMagicHour: true });
     expect(meme.generator).toBe("magichour");
     expect(meme.imageUrl).toContain("magichour.ai");

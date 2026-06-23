@@ -15,6 +15,13 @@
       "when": 1782172901916,
       "tag": "0001_confused_sunspot",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782256570992,
+      "tag": "0002_add_generator_column",
+      "breakpoints": true
     }
   ]
 }

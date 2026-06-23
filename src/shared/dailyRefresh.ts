@@ -4,14 +4,14 @@
 
 import { kvSet } from "../harness/store.js";
 import { getLatestStyleLogHistory, getRecentPostRecords } from "../harness/db.js";
-import { synthesizeStrategy } from "../modules/analytics.js";
+import { synthesizeStrategy, synthesizePostingPlan } from "../modules/analytics.js";
 import { fetchTrendingThemes } from "../modules/trendingThemes.js";
 import { fetchBlueskyTrendingThemes } from "../modules/blueskyTrending.js";
 import { fetchCurrentEvents } from "../modules/currentEvents.js";
+import { getPostingPlan, planTotalPosts } from "./postingPlan.js";
 import type { GenerationCap, StyleLog, StyleLogTopic } from "./types.js";
 import {
   NICHE,
-  MANDATORY_GENERATIONS,
   EXPLORATORY_GENERATIONS,
 } from "./constants.js";
 import { SEED_TOPICS } from "./config.js";
@@ -24,8 +24,9 @@ export async function runDailyRefresh(): Promise<void> {
   console.info("[daily-refresh] starting daily refresh...");
 
   await refreshStyleLog();
-  await refreshGenerationCap();
   await refreshStrategy();
+  await refreshPostingPlan();
+  await refreshGenerationCap();
   await refreshTrendingThemes();
   await refreshBlueskyTrendingThemes();
   await refreshCurrentEvents();
@@ -115,6 +116,17 @@ async function refreshStrategy(): Promise<void> {
   console.info(`[daily-refresh] strategy notes updated — ${updated.formatNotes.length} format notes`);
 }
 
+// Full-autonomy daily rewrite of the posting plan (generator mix per window) from
+// performance data. Best-effort — synthesizePostingPlan keeps the current plan on any
+// failure or when there isn't enough scored data yet.
+async function refreshPostingPlan(): Promise<void> {
+  try {
+    await synthesizePostingPlan();
+  } catch (err) {
+    console.warn("[daily-refresh] posting-plan synthesis failed, keeping existing plan:", err instanceof Error ? err.message : err);
+  }
+}
+
 // §3.7 step 1 — scrape reference accounts and write abstracted trending themes onto
 // style_log:today. fetchTrendingThemes() never throws (returns [] on empty config or
 // any failure), so this can only no-op, never block the rest of the refresh.
@@ -175,9 +187,13 @@ async function refreshGenerationCap(): Promise<void> {
     (r) => r.generatedAt > new Date(Date.now() - 24 * 60 * 60 * 1000)
   ).length;
 
+  // The mandatory budget tracks the number of scheduled posts in the active plan, so
+  // every scheduled post (Memegen or Magic Hour) is always allowed past the cap.
+  const mandatory = planTotalPosts(await getPostingPlan());
+
   const cap: GenerationCap = {
     date: new Date().toISOString().split("T")[0] ?? new Date().toISOString().slice(0, 10),
-    mandatory: MANDATORY_GENERATIONS,
+    mandatory,
     exploratory: EXPLORATORY_GENERATIONS,
     used: 0,
   };

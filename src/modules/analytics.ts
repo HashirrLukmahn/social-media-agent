@@ -14,10 +14,23 @@ import {
 import { v4 as uuidv4 } from "uuid";
 import type { RawEngagementMetrics, StyleLog, StyleLogTopic } from "../shared/types.js";
 import {
+  getPostingPlan,
+  savePostingPlan,
+  validatePlan,
+  planTotalPosts,
+  countByGenerator,
+} from "../shared/postingPlan.js";
+import {
   NICHE,
   SCORE_WEIGHTS,
   EMERGING_MIN_POSTS,
   ESTABLISHED_MIN_POSTS,
+  POSTING_WINDOWS,
+  POSTING_PLAN_MIN_POSTS,
+  POSTING_PLAN_MAX_POSTS,
+  POSTING_PLAN_MAX_PER_WINDOW,
+  POSTING_PLAN_MIN_SCORED,
+  MAGICHOUR_MAX_PER_DAY,
 } from "../shared/constants.js";
 
 const STYLE_LOG_KEY = "style_log:today";
@@ -252,6 +265,110 @@ ${priorLearningsBlock}`;
 
 function weekday(d: Date): string {
   return d.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" });
+}
+
+// Slot ids are `${date}:w${windowIndex}:p${n}` (older rows: `${date}:w${windowIndex}`).
+function parseWindowIndex(slotId: string): number | null {
+  const m = slotId.match(/:w(\d+)/);
+  return m && m[1] !== undefined ? parseInt(m[1], 10) : null;
+}
+
+// Daily, full-autonomy rewrite of the posting plan (the per-window generator mix).
+// Compares Memegen vs Magic Hour performance and per-window performance over the last
+// 14 days and asks the model to propose the next day's layout, which is then clamped
+// to the constants.ts guardrails by validatePlan(). Best-effort: any failure leaves
+// the current plan untouched. Called once/day from dailyRefresh.
+export async function synthesizePostingPlan(correlationId?: string): Promise<void> {
+  const current = await getPostingPlan();
+
+  const records = await getRecentPostRecords(NICHE, 14);
+  const scored = records.filter((r) => r.score !== null);
+
+  // Too little signal to deviate — keep the current plan rather than thrash on noise.
+  if (scored.length < POSTING_PLAN_MIN_SCORED) {
+    console.info(`[analytics] posting-plan: only ${scored.length} scored posts (need ${POSTING_PLAN_MIN_SCORED}) — keeping current plan`);
+    return;
+  }
+
+  // Aggregate scores by generator and by posting window.
+  const genStats = new Map<string, { n: number; sum: number }>();
+  const winStats = new Map<number, { n: number; sum: number }>();
+  for (const r of scored) {
+    const g = r.generator ?? "memegen"; // rows predating the column → treat as Memegen
+    const gs = genStats.get(g) ?? { n: 0, sum: 0 };
+    genStats.set(g, { n: gs.n + 1, sum: gs.sum + (r.score ?? 0) });
+
+    const wi = parseWindowIndex(r.slotId);
+    if (wi !== null) {
+      const ws = winStats.get(wi) ?? { n: 0, sum: 0 };
+      winStats.set(wi, { n: ws.n + 1, sum: ws.sum + (r.score ?? 0) });
+    }
+  }
+
+  const genLines = [...genStats.entries()]
+    .map(([g, s]) => `- ${g}: ${s.n} posts, avg score ${(s.sum / s.n).toFixed(2)}`)
+    .join("\n");
+  const winLines = POSTING_WINDOWS.map((_, i) => {
+    const s = winStats.get(i);
+    return `- window ${i}: ${s ? `${s.n} posts, avg score ${(s.sum / s.n).toFixed(2)}` : "no data yet"}`;
+  }).join("\n");
+
+  const system = `You tune the daily posting plan for an autonomous Bluesky software-engineering meme account.
+
+There are ${POSTING_WINDOWS.length} posting windows (indexed 0..${POSTING_WINDOWS.length - 1}). Each day you decide, per window, how many posts to make and which generator each uses:
+- "memegen": free template memes (Memegen.link).
+- "magichour": paid generative-AI memes (limited daily balance).
+
+Output a generatorsByWindow array with exactly ${POSTING_WINDOWS.length} inner arrays (one per window, in order). Each inner array lists the generators to post in that window (e.g. ["memegen","magichour"] = a double-up; [] = skip that window).
+
+HARD CONSTRAINTS (a violating plan will be auto-corrected, so stay within them):
+- Total posts/day: between ${POSTING_PLAN_MIN_POSTS} and ${POSTING_PLAN_MAX_POSTS}.
+- At most ${POSTING_PLAN_MAX_PER_WINDOW} posts per window.
+- At most ${MAGICHOUR_MAX_PER_DAY} "magichour" posts/day (cost guard).
+
+Shift the mix toward whatever the data shows performs better (by generator AND by window), but keep some of each generator unless one is clearly and consistently worse on a real sample. Don't over-fit to a tiny sample.
+
+Respond with ONLY valid JSON, no markdown:
+{ "generatorsByWindow": [["memegen","magichour"], ["memegen"], ["memegen"]], "rationale": "<1-2 sentences>" }`;
+
+  const user = `GENERATOR PERFORMANCE (last 14 days):
+${genLines || "(none)"}
+
+WINDOW PERFORMANCE (last 14 days):
+${winLines}
+
+CURRENT PLAN: ${JSON.stringify(current.generatorsByWindow)}
+CURRENT PLAN RATIONALE: ${current.rationale}`;
+
+  let proposed: { generatorsByWindow?: unknown; rationale?: unknown };
+  try {
+    proposed = await harnessedCall(
+      {
+        agentName: "analytics",
+        action: "synthesize-posting-plan",
+        input: { scoredPosts: scored.length, generators: [...genStats.keys()] },
+        correlationId,
+        skipCircuitBreaker: true,
+      },
+      async () => {
+        const text = await completeText({ system, user, maxTokens: 512 });
+        const clean = text.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+        return JSON.parse(clean) as { generatorsByWindow?: unknown; rationale?: unknown };
+      }
+    );
+  } catch (err) {
+    console.warn("[analytics] posting-plan synthesis failed — keeping current plan:", err instanceof Error ? err.message : err);
+    return;
+  }
+
+  const rationale = typeof proposed.rationale === "string" ? proposed.rationale : "";
+  const plan = validatePlan(proposed.generatorsByWindow, rationale);
+  await savePostingPlan(plan);
+
+  console.info(
+    `[analytics] posting-plan updated → ${planTotalPosts(plan)} posts/day ` +
+    `(${countByGenerator(plan, "memegen")} memegen, ${countByGenerator(plan, "magichour")} magichour): ${plan.rationale}`
+  );
 }
 
 // Best-effort Mem0 recall, wrapped in the harness. Returns [] on any failure or
