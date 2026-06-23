@@ -7,7 +7,15 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 
+// Cheap/fast tier — safety review, sentiment, the like meme/humor classifier, and
+// theme/strategy synthesis. These are short YES/NO or extraction tasks that don't
+// need a heavy model.
 export const CLASSIFIER_MODEL = "claude-haiku-4-5";
+
+// Heavier tier for the creative meme-spec generation call. Haiku produced repetitive
+// jokes/templates; Sonnet 4.6 gives more variety. Used only where passed explicitly
+// (see memeGenerator.generateMemeSpec) — the default below stays on the cheap tier.
+export const GENERATION_MODEL = "claude-sonnet-4-6";
 
 let client: Anthropic | null = null;
 // Shared singleton. Reads ANTHROPIC_API_KEY from the environment automatically.
@@ -26,9 +34,12 @@ export async function completeText(opts: {
   system: string;
   user: string;
   maxTokens: number;
+  // Optional model override. Defaults to the cheap classifier tier; pass
+  // GENERATION_MODEL for the creative meme-spec call.
+  model?: string;
 }): Promise<string> {
   const response = await getAnthropic().messages.create({
-    model: CLASSIFIER_MODEL,
+    model: opts.model ?? CLASSIFIER_MODEL,
     max_tokens: opts.maxTokens,
     system: opts.system,
     messages: [{ role: "user", content: opts.user }],

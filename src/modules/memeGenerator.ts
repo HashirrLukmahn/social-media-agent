@@ -15,7 +15,7 @@ import { harnessedCall } from "../harness/index.js";
 import { kvGet } from "../harness/store.js";
 import { getRecentTemplates } from "../harness/db.js";
 import { recallRecentTemplates, rememberPostedMeme } from "../shared/mem0.js";
-import { completeText } from "../shared/llm.js";
+import { completeText, GENERATION_MODEL } from "../shared/llm.js";
 import { getTemplates, renderMemegen } from "./memegen.js";
 import { renderMagicHour, isDepletedError } from "./magicHour.js";
 import { assertGenerationAllowed, recordGeneration, type GenerationType } from "../shared/generationCap.js";
@@ -92,6 +92,11 @@ function styleContext(styleLog: StyleLog): string {
   // §3.7: trending themes + current events are OPTIONAL topic inspiration only.
   if (styleLog.trendingThemes.length > 0) {
     parts.push(`Trending themes (optional — use only if one fits naturally, never copy a specific joke):\n${styleLog.trendingThemes.map((t) => `- ${t}`).join("\n")}`);
+  }
+  // Feature 3: what's landing on Bluesky's own feed today. OPTIONAL inspiration, same
+  // as the other context fields — reference it only when something fits naturally.
+  if (styleLog.blueskyTrendingThemes && styleLog.blueskyTrendingThemes.length > 0) {
+    parts.push(`What's resonating on Bluesky today (optional — only if one fits naturally, never copy a specific joke):\n${styleLog.blueskyTrendingThemes.map((t) => `- ${t}`).join("\n")}`);
   }
   if (styleLog.currentEventsContext.length > 0) {
     parts.push(`Current events (optional — only if it fits the niche and style):\n${styleLog.currentEventsContext.map((e) => `- ${e}`).join("\n")}`);
@@ -178,7 +183,8 @@ Niche: ${styleLog.niche}${styleContext(styleLog)}${avoidNote}
 Template menu (choose the id whose structure fits the joke best):
 ${menu}`;
 
-  const text = await completeText({ system, user, maxTokens: 512 });
+  // Sonnet 4.6 for the creative spec — Haiku's jokes/templates were too repetitive.
+  const text = await completeText({ system, user, maxTokens: 512, model: GENERATION_MODEL });
   const clean = text.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
 
   let parsed: {

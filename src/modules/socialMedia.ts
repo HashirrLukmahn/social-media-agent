@@ -3,21 +3,44 @@
 // Does not own the clock loop or daily refresh — those live in scheduler.ts.
 
 import { BskyAgent, RichText } from "@atproto/api";
+import { v4 as uuidv4 } from "uuid";
 import { harnessedCall } from "../harness/index.js";
 import {
   insertPostRecord,
   updatePostRecord,
   insertScheduledJob,
   getRecentPostRecords,
+  insertFollow,
+  getFollowedDids,
+  getTakedownUris,
 } from "../harness/db.js";
 import { notifyMemePosted } from "../harness/alert.js";
 import { rememberPostedMeme } from "../shared/mem0.js";
-import { DEFAULT_HASHTAGS, MAX_REPLIES_PER_CYCLE, NICHE } from "../shared/constants.js";
+import { completeText } from "../shared/llm.js";
+import {
+  canFollowMore,
+  recordFollow,
+  canLikeMore,
+  recordLike,
+} from "../shared/engagementCap.js";
+import {
+  DEFAULT_HASHTAGS,
+  MAX_REPLIES_PER_CYCLE,
+  NICHE,
+  NICHE_HASHTAGS,
+  FOLLOW_DELAY_SECONDS,
+  LIKE_DELAY_SECONDS,
+  FOLLOW_MIN_NICHE_POSTS,
+  LIKE_MIN_REPOSTS,
+  LIKE_MIN_LIKES,
+} from "../shared/constants.js";
 import type { GeneratedMeme, RawEngagementMetrics } from "../shared/types.js";
 
 let bskyAgent: BskyAgent | null = null;
 
-async function getBskyAgent(): Promise<BskyAgent> {
+// Exported so the daily Bluesky trending-themes job (Feature 3) reuses the same
+// logged-in agent singleton rather than opening a second session.
+export async function getBskyAgent(): Promise<BskyAgent> {
   if (bskyAgent) return bskyAgent;
 
   bskyAgent = new BskyAgent({ service: "https://bsky.social" });
@@ -166,6 +189,295 @@ export async function runReplyEngagement(correlationId?: string): Promise<void> 
   );
 }
 
+// ── Growth engagement pass (Features 1 & 2) ──────────────────────────────────
+// After each posting cycle: one shared niche-hashtag search whose results feed both
+// the follow-candidate (Feature 1) and like-candidate (Feature 2) identification.
+// Every follow/like is wrapped in harnessedCall, capped per day, and spaced out with
+// a random delay so we never act in a rapid burst. A single failed action logs and
+// moves on — it never crashes the cycle.
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Random delay in ms within [minSec, maxSec]. Spaces out growth actions.
+function randomDelayMs(minSec: number, maxSec: number): number {
+  return Math.round((minSec + Math.random() * (maxSec - minSec)) * 1000);
+}
+
+// Defensively-typed view of the fields we read off a Bluesky search result.
+interface SearchPost {
+  uri: string;
+  cid: string;
+  text: string;
+  authorDid: string;
+  authorHandle: string;
+  alreadyFollowing: boolean; // from the post author's viewer state
+  alreadyLiked: boolean; // from the post's viewer state
+  likeCount: number;
+  repostCount: number;
+  matchedHashtag: string; // first niche hashtag found in the post text ("" if none)
+}
+
+// First niche hashtag present in the text (case-insensitive), or "" — used to record
+// which hashtag surfaced a follow.
+function matchHashtag(text: string): string {
+  const lower = text.toLowerCase();
+  for (const tag of NICHE_HASHTAGS) {
+    if (lower.includes(tag.toLowerCase())) return tag;
+  }
+  return "";
+}
+
+// Normalize a raw Bluesky PostView into the subset of fields we use. Tolerant of
+// missing/loosely-typed fields so a malformed result can never throw mid-pass.
+function normalizeSearchPost(raw: unknown): SearchPost | null {
+  const p = raw as {
+    uri?: string;
+    cid?: string;
+    record?: { text?: string };
+    author?: { did?: string; handle?: string; viewer?: { following?: string } };
+    viewer?: { like?: string };
+    likeCount?: number;
+    repostCount?: number;
+  };
+  if (!p.uri || !p.cid || !p.author?.did || !p.author?.handle) return null;
+  const text = typeof p.record?.text === "string" ? p.record.text : "";
+  return {
+    uri: p.uri,
+    cid: p.cid,
+    text,
+    authorDid: p.author.did,
+    authorHandle: p.author.handle,
+    alreadyFollowing: Boolean(p.author.viewer?.following),
+    alreadyLiked: Boolean(p.viewer?.like),
+    likeCount: typeof p.likeCount === "number" ? p.likeCount : 0,
+    repostCount: typeof p.repostCount === "number" ? p.repostCount : 0,
+    matchedHashtag: matchHashtag(text),
+  };
+}
+
+// Gemini-Flash-style YES/NO classifier (run on Claude Haiku via completeText, the
+// project's standard cheap classifier path) — "is this a meme/humorous post?".
+// Read-only: skips the circuit breaker and returns false on any failure (we simply
+// don't like rather than mis-like).
+async function isMemeOrHumor(caption: string, correlationId?: string): Promise<boolean> {
+  if (!caption.trim()) return false;
+  try {
+    const text = await harnessedCall(
+      {
+        agentName: "social-media",
+        action: "like-meme-classifier",
+        input: { caption: caption.slice(0, 100) },
+        correlationId,
+        skipCircuitBreaker: true,
+      },
+      () =>
+        completeText({
+          system: "Is this a meme or humorous post? Reply YES or NO only.",
+          user: caption,
+          maxTokens: 4,
+        })
+    );
+    return /^\s*yes/i.test(text);
+  } catch (err) {
+    console.warn("[social-media] meme classifier failed — not liking:", err instanceof Error ? err.message : err);
+    return false;
+  }
+}
+
+// Feature 1 — follow up to FOLLOW_DAILY_CAP accounts/day that have posted at least
+// FOLLOW_MIN_NICHE_POSTS times in the niche hashtags, aren't us, and we don't
+// already follow. Spaced 30–90s apart.
+async function runFollowPass(
+  posts: SearchPost[],
+  botDid: string,
+  botHandle: string | undefined,
+  correlationId?: string
+): Promise<void> {
+  // Tally posts per author from the shared search to find repeat niche posters.
+  const byAuthor = new Map<
+    string,
+    { handle: string; count: number; source: string; alreadyFollowing: boolean }
+  >();
+  for (const post of posts) {
+    const existing = byAuthor.get(post.authorDid);
+    if (existing) {
+      existing.count += 1;
+      if (!existing.source && post.matchedHashtag) existing.source = post.matchedHashtag;
+    } else {
+      byAuthor.set(post.authorDid, {
+        handle: post.authorHandle,
+        count: 1,
+        source: post.matchedHashtag,
+        alreadyFollowing: post.alreadyFollowing,
+      });
+    }
+  }
+
+  const alreadyFollowedDids = await getFollowedDids().catch((err) => {
+    console.warn("[social-media] could not load followed DIDs — skipping follow pass:", err instanceof Error ? err.message : err);
+    return null;
+  });
+  if (alreadyFollowedDids === null) return;
+
+  const candidates = [...byAuthor.entries()].filter(([did, info]) => {
+    if (info.count < FOLLOW_MIN_NICHE_POSTS) return false; // not a repeat niche poster
+    if (did === botDid || info.handle === botHandle) return false; // not ourselves
+    if (info.alreadyFollowing) return false; // already following (viewer state)
+    if (alreadyFollowedDids.has(did)) return false; // already followed (our record)
+    return true;
+  });
+
+  console.info(`[social-media] follow pass: ${candidates.length} candidate accounts from ${posts.length} posts`);
+
+  let first = true;
+  for (const [did, info] of candidates) {
+    // Re-check the daily cap before EVERY follow — stop the moment we hit 20,
+    // regardless of how many candidates remain in the cycle.
+    if (!(await canFollowMore())) {
+      console.info("[social-media] daily follow cap reached — stopping follow pass");
+      break;
+    }
+
+    // Space follows out 30–90s — never a rapid burst.
+    if (!first) await sleep(randomDelayMs(FOLLOW_DELAY_SECONDS.min, FOLLOW_DELAY_SECONDS.max));
+    first = false;
+
+    try {
+      await harnessedCall(
+        {
+          agentName: "social-media",
+          action: "follow-account",
+          input: { did, handle: info.handle, source: info.source },
+          correlationId,
+        },
+        async () => {
+          const agent = await getBskyAgent();
+          await agent.follow(did);
+        }
+      );
+      await insertFollow({
+        id: uuidv4(),
+        did,
+        handle: info.handle,
+        followedAt: new Date(),
+        source: info.source || NICHE_HASHTAGS.join(","),
+      });
+      const total = await recordFollow();
+      console.info(`[social-media] followed @${info.handle} (source: ${info.source || "niche"}) — ${total} today`);
+    } catch (err) {
+      // A failed follow logs and moves on — never crashes the cycle.
+      console.warn(`[social-media] follow failed for @${info.handle}:`, err instanceof Error ? err.message : err);
+    }
+  }
+}
+
+// Feature 2 — like up to LIKE_DAILY_CAP posts/day that show real traction (>=1 repost
+// OR >=3 likes), aren't ours, we haven't already liked, aren't in the takedown log,
+// and the classifier judges a meme/humor post. Spaced 10–30s apart.
+async function runLikePass(
+  posts: SearchPost[],
+  botHandle: string | undefined,
+  correlationId?: string
+): Promise<void> {
+  const takenDownUris = await getTakedownUris().catch((err) => {
+    console.warn("[social-media] could not load takedown log — skipping like pass:", err instanceof Error ? err.message : err);
+    return null;
+  });
+  if (takenDownUris === null) return;
+
+  let first = true;
+  let likedCount = 0;
+  for (const post of posts) {
+    if (!(await canLikeMore())) {
+      console.info("[social-media] daily like cap reached — stopping like pass");
+      break;
+    }
+
+    // Cheap structural filters first (no network / no LLM):
+    if (post.authorHandle === botHandle) continue; // not our own post
+    if (post.alreadyLiked) continue; // already liked (viewer state)
+    if (takenDownUris.has(post.uri)) continue; // flagged by safety review — never like
+    const hasTraction = post.repostCount >= LIKE_MIN_REPOSTS || post.likeCount >= LIKE_MIN_LIKES;
+    if (!hasTraction) continue; // not genuinely good, just in the feed
+
+    // Only then spend an LLM call on the meme/humor classifier.
+    if (!(await isMemeOrHumor(post.text, correlationId))) continue;
+
+    // Space likes out 10–30s — never a rapid burst.
+    if (!first) await sleep(randomDelayMs(LIKE_DELAY_SECONDS.min, LIKE_DELAY_SECONDS.max));
+    first = false;
+
+    try {
+      await harnessedCall(
+        {
+          agentName: "social-media",
+          action: "like-post",
+          input: { uri: post.uri, handle: post.authorHandle },
+          correlationId,
+        },
+        async () => {
+          const agent = await getBskyAgent();
+          await agent.like(post.uri, post.cid);
+        }
+      );
+      const total = await recordLike();
+      likedCount += 1;
+      console.info(`[social-media] liked post by @${post.authorHandle} — ${total} today`);
+    } catch (err) {
+      // A failed like logs and moves on.
+      console.warn(`[social-media] like failed for ${post.uri}:`, err instanceof Error ? err.message : err);
+    }
+  }
+  console.info(`[social-media] like pass complete — ${likedCount} new likes this cycle`);
+}
+
+// Entry point for the per-cycle growth pass. One shared hashtag search, reused for
+// both the follow and like passes (§ rate-limit note: search once, use twice).
+export async function runEngagementGrowthPass(correlationId?: string): Promise<void> {
+  const botHandle = process.env["BSKY_HANDLE"];
+  const query = NICHE_HASHTAGS.join(" OR ");
+
+  let posts: SearchPost[];
+  try {
+    posts = await harnessedCall(
+      {
+        agentName: "social-media",
+        action: "growth-hashtag-search",
+        input: { query },
+        correlationId,
+        skipCircuitBreaker: true,
+      },
+      async () => {
+        const agent = await getBskyAgent();
+        const { data } = await agent.app.bsky.feed.searchPosts({
+          q: query,
+          limit: 100,
+          sort: "latest",
+        });
+        return data.posts
+          .map(normalizeSearchPost)
+          .filter((p): p is SearchPost => p !== null);
+      }
+    );
+  } catch (err) {
+    console.warn("[social-media] growth hashtag search failed — skipping growth pass:", err instanceof Error ? err.message : err);
+    return;
+  }
+
+  const agent = await getBskyAgent().catch(() => null);
+  const botDid = agent?.session?.did ?? "";
+
+  // Follow pass then like pass — both read from the same `posts`, no second search.
+  await runFollowPass(posts, botDid, botHandle, correlationId).catch((err) => {
+    console.warn("[social-media] follow pass errored:", err instanceof Error ? err.message : err);
+  });
+  await runLikePass(posts, botHandle, correlationId).catch((err) => {
+    console.warn("[social-media] like pass errored:", err instanceof Error ? err.message : err);
+  });
+}
+
 // Posts a meme for the given slot. Handles idempotency, DB record lifecycle, and
 // schedules Postgres-backed engagement polls on success.
 export async function postMemeToSlot(
@@ -217,5 +529,12 @@ export async function postMemeToSlot(
 
   await runReplyEngagement(correlationId).catch((err) => {
     console.warn("[social-media] reply engagement pass failed:", err instanceof Error ? err.message : err);
+  });
+
+  // Features 1 & 2: follow relevant accounts + like relevant posts from one shared
+  // niche-hashtag search. Best-effort — a growth-pass failure must never undo the
+  // successful post or crash the cycle.
+  await runEngagementGrowthPass(correlationId).catch((err) => {
+    console.warn("[social-media] engagement growth pass failed:", err instanceof Error ? err.message : err);
   });
 }

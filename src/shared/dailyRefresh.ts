@@ -6,6 +6,7 @@ import { kvSet } from "../harness/store.js";
 import { getLatestStyleLogHistory, getRecentPostRecords } from "../harness/db.js";
 import { synthesizeStrategy } from "../modules/analytics.js";
 import { fetchTrendingThemes } from "../modules/trendingThemes.js";
+import { fetchBlueskyTrendingThemes } from "../modules/blueskyTrending.js";
 import { fetchCurrentEvents } from "../modules/currentEvents.js";
 import type { GenerationCap, StyleLog, StyleLogTopic } from "./types.js";
 import {
@@ -26,6 +27,7 @@ export async function runDailyRefresh(): Promise<void> {
   await refreshGenerationCap();
   await refreshStrategy();
   await refreshTrendingThemes();
+  await refreshBlueskyTrendingThemes();
   await refreshCurrentEvents();
 
   console.info("[daily-refresh] daily refresh complete");
@@ -44,6 +46,9 @@ async function refreshStyleLog(): Promise<void> {
     if (snapshot.trendingThemes === undefined) {
       snapshot = { ...snapshot, trendingThemes: [] };
     }
+    if (snapshot.blueskyTrendingThemes === undefined) {
+      snapshot = { ...snapshot, blueskyTrendingThemes: [] };
+    }
     if (snapshot.currentEventsContext === undefined) {
       snapshot = { ...snapshot, currentEventsContext: [] };
     }
@@ -57,6 +62,7 @@ async function refreshStyleLog(): Promise<void> {
       formatNotes: [],
       audienceNotes: "",
       trendingThemes: [],
+      blueskyTrendingThemes: [],
       currentEventsContext: [],
       publicSentimentTowardDevs: null,
       lastUpdated: new Date().toISOString(),
@@ -122,6 +128,22 @@ async function refreshTrendingThemes(): Promise<void> {
 
   await kvSet(STYLE_LOG_KEY, updated, TTL_SECONDS);
   console.info(`[daily-refresh] trending themes updated — ${trendingThemes.length} themes`);
+}
+
+// Feature 3 — search Bluesky's OWN top niche posts (last 24hr) and write abstracted
+// theme observations onto style_log:today, alongside (not replacing) trendingThemes.
+// fetchBlueskyTrendingThemes() never throws (returns [] on any failure), so this can
+// only no-op, never block the rest of the refresh.
+async function refreshBlueskyTrendingThemes(): Promise<void> {
+  const current = await import("../harness/store.js")
+    .then(({ kvGet }) => kvGet<StyleLog>(STYLE_LOG_KEY));
+  if (!current) return;
+
+  const blueskyTrendingThemes = await fetchBlueskyTrendingThemes();
+  const updated: StyleLog = { ...current, blueskyTrendingThemes, lastUpdated: new Date().toISOString() };
+
+  await kvSet(STYLE_LOG_KEY, updated, TTL_SECONDS);
+  console.info(`[daily-refresh] bluesky trending themes updated — ${blueskyTrendingThemes.length} themes`);
 }
 
 // §3.7 step 2 — one Claude web-search call for today's tech/cultural context, written

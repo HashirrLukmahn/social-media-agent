@@ -33,6 +33,35 @@ export const EXPLORATORY_GENERATIONS = 5;
 // Bluesky hashtags for discovery. Tune based on style log engagement data.
 export const DEFAULT_HASHTAGS = ["#softwareengineering", "#devhumor", "#buildinpublic"] as const;
 
+// Niche hashtags used to discover follow/like candidates (Features 1 & 2) and to
+// scrape Bluesky's own top memes (Feature 3). Broader than DEFAULT_HASHTAGS so the
+// search surfaces more of the community, not just our own posting tags.
+export const NICHE_HASHTAGS = [
+  "#softwareengineering",
+  "#devhumor",
+  "#buildinpublic",
+  "#ProgrammerHumor",
+] as const;
+
+// Daily growth-engagement caps (Features 1 & 2). Stored in Redis as follows_today /
+// likes_today (TTL 24hr), checked before every follow/like action.
+export const FOLLOW_DAILY_CAP = 20;
+export const LIKE_DAILY_CAP = 50;
+
+// Random spacing between growth actions, in seconds — never act in a rapid burst.
+// Follows are spaced wider than likes (a follow is a stronger, more visible signal).
+export const FOLLOW_DELAY_SECONDS = { min: 30, max: 90 } as const;
+export const LIKE_DELAY_SECONDS = { min: 10, max: 30 } as const;
+
+// Engagement signal thresholds for like candidates (Feature 2): a post must clear
+// one of these to be considered "genuinely good", not just any post in the feed.
+export const LIKE_MIN_REPOSTS = 1;
+export const LIKE_MIN_LIKES = 3;
+
+// Minimum times an account must appear in the niche-hashtag search to be a follow
+// candidate (Feature 1) — filters out one-off / drive-by posters.
+export const FOLLOW_MIN_NICHE_POSTS = 2;
+
 // Safety constraints baked into every meme-generation request (§6 layer 1).
 export const SAFETY_CONSTRAINTS = `
 NEVER generate content that:

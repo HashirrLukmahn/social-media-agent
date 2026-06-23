@@ -69,3 +69,27 @@ export const scheduledJobs = pgTable("scheduled_jobs", {
   firedAt: timestamp("fired_at"),
   status: text("status").notNull().default("pending"), // 'pending' | 'fired' | 'failed'
 });
+
+// Accounts the bot has followed during the per-cycle growth pass (Feature 1).
+// One row per follow. The daily 20-follow cap is enforced separately in Redis
+// (follows_today); this table is the durable record of who we've followed so we
+// never follow the same account twice.
+export const follows = pgTable("follows", {
+  id: text("id").primaryKey(), // uuid
+  did: text("did").notNull(), // the followed account's DID
+  handle: text("handle").notNull(), // their handle at time of follow
+  followedAt: timestamp("followed_at").notNull(),
+  source: text("source").notNull(), // which niche hashtag surfaced them
+});
+
+// Content the safety-review system has FLAGGED (§6). The growth pass cross-references
+// like-candidate posts against this log so the bot never likes content (by URI) that
+// the safety system has flagged. Populated by safetyReview.ts on the FLAGGED path.
+export const takedownLog = pgTable("takedown_log", {
+  id: text("id").primaryKey(), // uuid
+  uri: text("uri"), // external post URI if applicable (null for our own pre-post flags)
+  caption: text("caption"), // the flagged caption/content
+  reason: text("reason").notNull(), // why it was flagged
+  source: text("source").notNull(), // 'safety-review'
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});

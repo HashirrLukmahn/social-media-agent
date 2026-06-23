@@ -26,6 +26,11 @@ export interface StyleLog {
   // Themes/formats only, never literal scraped captions. Empty when the scrape is
   // skipped (empty account list) or fails — never blocks the rest of the refresh.
   trendingThemes: string[];
+  // Abstracted theme bullets from the daily Bluesky top-memes scrape (Feature 3) —
+  // what's resonating on the TARGET platform's own feed (topics, joke structures,
+  // tones). Supplements trendingThemes (which comes from Instagram). Empty when the
+  // search returns nothing or fails — never blocks the rest of the refresh.
+  blueskyTrendingThemes: string[];
   // Short current-events bullets from the daily Claude web-search call (§3.7 step 2):
   // today's tech/startup/big-tech news plus any major live cultural event. Empty when
   // the call fails — never blocks the rest of the refresh. Optional topic inspiration.

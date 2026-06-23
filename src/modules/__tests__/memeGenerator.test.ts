@@ -42,7 +42,7 @@ vi.mock("../../shared/mem0.js", () => ({
 const completeText = vi.fn(async () =>
   JSON.stringify({ template: "drake", topText: "top", bottomText: "bottom", caption: "a relatable caption" })
 );
-vi.mock("../../shared/llm.js", () => ({ completeText: (...a: unknown[]) => completeText(...a), getAnthropic: vi.fn() }));
+vi.mock("../../shared/llm.js", () => ({ completeText: (...a: unknown[]) => completeText(...a), getAnthropic: vi.fn(), CLASSIFIER_MODEL: "claude-haiku-4-5", GENERATION_MODEL: "claude-sonnet-4-6" }));
 
 // Memegen.link — controllable render.
 const renderMemegen = vi.fn(async () => "https://api.memegen.link/images/drake/top/bottom.png");
@@ -71,6 +71,7 @@ function seed(capUsed = 0): void {
     formatNotes: [],
     audienceNotes: "",
     trendingThemes: [],
+    blueskyTrendingThemes: [],
     currentEventsContext: [],
     publicSentimentTowardDevs: null,
     lastUpdated: NOW,

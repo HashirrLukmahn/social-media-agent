@@ -1,8 +1,10 @@
 // Full multi-layer safety chain per spec §6.
 // Kept as its own module so it remains easy to point to and explain in the walkthrough.
 
+import { v4 as uuidv4 } from "uuid";
 import { harnessedCall } from "../harness/index.js";
 import { completeText } from "../shared/llm.js";
+import { insertTakedown } from "../harness/db.js";
 import { generateMeme, getFallbackMeme } from "./memeGenerator.js";
 import type { GeneratedMeme } from "../shared/types.js";
 
@@ -43,6 +45,20 @@ export async function reviewSafety(
         return { status: "SAFE" as const };
       }
       const reason = text.startsWith("FLAGGED:") ? text.slice(8).trim() : "content policy";
+
+      // Persist the flag to the takedown log so the growth pass (Feature 2) can
+      // cross-reference and never like content the safety system has flagged.
+      // Best-effort: a DB hiccup must not change the review outcome.
+      await insertTakedown({
+        id: uuidv4(),
+        uri: null,
+        caption: meme.caption,
+        reason,
+        source: "safety-review",
+      }).catch((err) =>
+        console.warn("[safety-review] failed to write takedown log:", err instanceof Error ? err.message : err)
+      );
+
       return { status: "FLAGGED" as const, reason };
     }
   );

@@ -205,3 +205,40 @@ export async function markScheduledJobFailed(id: string): Promise<void> {
     .set({ status: "failed" })
     .where(eq(schema.scheduledJobs.id, id));
 }
+
+// ── Follows (Feature 1) ──────────────────────────────────────────────────────
+
+export async function insertFollow(
+  record: typeof schema.follows.$inferInsert
+): Promise<void> {
+  await getDb().insert(schema.follows).values(record);
+}
+
+// All DIDs the bot has ever followed — used to skip accounts we already follow.
+export async function getFollowedDids(): Promise<Set<string>> {
+  const rows = await getDb()
+    .select({ did: schema.follows.did })
+    .from(schema.follows);
+  return new Set(rows.map((r) => r.did));
+}
+
+// ── Takedown log (Feature 2 cross-reference) ─────────────────────────────────
+
+export async function insertTakedown(
+  record: typeof schema.takedownLog.$inferInsert
+): Promise<void> {
+  await getDb().insert(schema.takedownLog).values(record);
+}
+
+// All non-null post URIs the safety system has flagged — used to skip liking
+// content that's already been taken down.
+export async function getTakedownUris(): Promise<Set<string>> {
+  const rows = await getDb()
+    .select({ uri: schema.takedownLog.uri })
+    .from(schema.takedownLog);
+  const out = new Set<string>();
+  for (const r of rows) {
+    if (r.uri) out.add(r.uri);
+  }
+  return out;
+}
