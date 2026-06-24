@@ -47,7 +47,11 @@ vi.mock("../../shared/llm.js", () => ({ completeText: (...a: unknown[]) => compl
 // Memegen.link — controllable render.
 const renderMemegen = vi.fn(async () => "https://api.memegen.link/images/drake/top/bottom.png");
 vi.mock("../memegen.js", () => ({
-  getTemplates: vi.fn(async () => new Map([["drake", { id: "drake", name: "Drake", lines: 2 }]])),
+  // Catalog includes a non-curated id ("obscure") to exercise full-open-catalog picks.
+  getTemplates: vi.fn(async () => new Map([
+    ["drake", { id: "drake", name: "Drake", lines: 2 }],
+    ["obscure", { id: "obscure", name: "Obscure One", lines: 2 }],
+  ])),
   renderMemegen: (...a: unknown[]) => renderMemegen(...a),
 }));
 
@@ -56,6 +60,8 @@ const renderMagicHour = vi.fn(async () => "https://videos.magichour.ai/abc/outpu
 vi.mock("../magicHour.js", () => ({
   renderMagicHour: (...a: unknown[]) => renderMagicHour(...a),
   isDepletedError: () => true,
+  isMagicHourTemplate: (t: string) => ["Random", "Drake Hotline Bling", "Two Buttons"].includes(t),
+  MAGIC_HOUR_TEMPLATE_HINTS: { "Random": "let Magic Hour choose", "Drake Hotline Bling": "comparison" },
 }));
 
 import { generateMeme } from "../memeGenerator.js";
@@ -130,10 +136,43 @@ describe("generateMeme — generator routing", () => {
     expect(renderMagicHour).toHaveBeenCalledOnce();
   });
 
+  it("passes the model-chosen Magic Hour template to renderMagicHour", async () => {
+    completeText.mockResolvedValueOnce(
+      JSON.stringify({ template: "drake", magicHourTemplate: "Two Buttons", topText: "t", bottomText: "b", caption: "c" })
+    );
+    await generateMeme("slot-mh", "corr-mh", { generator: "magichour" });
+    expect(renderMagicHour).toHaveBeenCalledWith(expect.any(String), "Two Buttons");
+  });
+
+  it("falls back to Random when the model picks an unsupported Magic Hour template", async () => {
+    completeText.mockResolvedValueOnce(
+      JSON.stringify({ template: "drake", magicHourTemplate: "Not A Real Template", topText: "t", bottomText: "b", caption: "c" })
+    );
+    await generateMeme("slot-mh2", "corr-mh2", { generator: "magichour" });
+    expect(renderMagicHour).toHaveBeenCalledWith(expect.any(String), "Random");
+  });
+
   it("defaults to mandatory/Memegen when no options are given", async () => {
     const meme = await generateMeme("slot-4");
     expect(meme.generator).toBe("memegen");
     expect(renderMagicHour).not.toHaveBeenCalled();
+  });
+
+  it("accepts a non-curated catalog template id (full open catalog)", async () => {
+    completeText.mockResolvedValueOnce(
+      JSON.stringify({ template: "obscure", topText: "t", bottomText: "b", caption: "c" })
+    );
+    const meme = await generateMeme("slot-cat", "corr-cat");
+    expect(meme.templateUsed).toBe("obscure");
+    expect(renderMemegen).toHaveBeenCalledWith("obscure", expect.any(Array));
+  });
+
+  it("falls back to an anchor when the model returns a non-existent template id", async () => {
+    completeText.mockResolvedValueOnce(
+      JSON.stringify({ template: "not_in_catalog", topText: "t", bottomText: "b", caption: "c" })
+    );
+    const meme = await generateMeme("slot-bad", "corr-bad");
+    expect(["drake", "fine", "aag"]).toContain(meme.templateUsed);
   });
 });
 

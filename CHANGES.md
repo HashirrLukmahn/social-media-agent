@@ -1,5 +1,66 @@
 # Build Log & Next-Build Suggestions
 
+## Build 4 — 2026-06-24 (inline images + meme-template flexibility)
+
+**Inline images (was posting links).** Posts embedded the meme as `app.bsky.embed.external`
+(a link card pointing at the image URL), so Bluesky showed a link, not a picture. Now
+`postBluesky` fetches the image bytes, uploads them via `agent.uploadBlob`, and embeds
+`app.bsky.embed.images` so the meme renders inline. Applies to both generators (they
+only return URLs). Content type is detected from the response header.
+
+**Large-image downscaling (`sharp`).** Bluesky rejects image blobs over ~1MB. Added
+`sharp`; `uploadMemeImage` downscales/recompresses (descending widths × JPEG qualities)
+anything over the cap before upload. Memegen PNGs (~0.5MB) pass untouched; photographic
+Magic Hour outputs get compressed. Verified a 13.7MB worst-case PNG → 786KB.
+
+**Magic Hour template flexibility.** Magic Hour's `template` is a CLOSED, server-validated
+enum of 13 values — it cannot be extended (the SDK rejects anything else). So instead:
+(a) `searchWeb: true` (was false) lets Magic Hour pull current web meme content, and
+(b) the meme-spec model now picks the best-fit of the 13 per joke (with when-to-use hints),
+validated against the enum (→ `Random` on a bad pick), instead of always defaulting to
+`Random`.
+
+**Memegen full open catalog + expanded hints.** Memegen's catalog is open (~209 templates,
+all already fetched) but the model was only ever shown 11. Now the meme-spec model may pick
+ANY valid catalog id — the curated set just provides usage notes; the rest of the catalog is
+offered by id+name, and the pick is validated against the live catalog (recently-used ids
+excluded, falls back to an anchor on an invalid pick). The curated `TEMPLATE_HINTS` grew
+11 → 30 verified templates (and fixed the `aag` mislabel — it's "Ancient Aliens Guy", not
+"always has been"). Known limit: only two text lines render, so the prompt steers away from
+multi-panel formats (variable-line rendering is a possible follow-up). 40 tests passing.
+
+## Build 3 — 2026-06-23 (Magic Hour scheduled posts + autonomous posting plan)
+
+Three changes, shipped to `main` (commit `0908c32`); migration `0002` applied to prod.
+
+**Growth-search fix.** The follow/like growth pass searched Bluesky with the niche
+hashtags joined by `" OR "`. Bluesky `searchPosts` does **not** support boolean OR, so
+the query matched 0 posts and both the follow and like passes were silently starved
+(0 follows ever recorded). Now each hashtag is searched separately and the results are
+merged/de-duped by post URI. The follow/like API params were correct all along — they
+just never had any posts to act on. (Per-hashtag returns ~100 each; ~36% clear the
+like-traction gate.)
+
+**Magic Hour as scheduled posts (3 → 5 memes/day).** Magic Hour was previously
+"exploratory only, never a scheduled post" and so was effectively dormant. Now a
+persistent Redis posting plan (`posting_plan`, no TTL) drives the schedule, defaulting
+to **3 Memegen + 2 Magic Hour**, doubled up on the first two windows
+(`[[memegen,magichour],[memegen,magichour],[memegen]]`). The scheduler builds one
+generator-tagged slot per post; `generateMeme` gained a `generator` option so scheduled
+posts can route to Magic Hour (keeping the reactive depletion → Memegen fallback). The
+old "mandatory posts never reach Magic Hour" rule was removed. Each post's actual
+generator is now persisted to `post_records.generator` (migration `0002`) so
+performance can be split by source.
+
+**Autonomous daily posting-plan tuning.** A new `synthesizePostingPlan` runs once/day in
+`dailyRefresh`: it compares per-generator and per-window engagement scores (last 14d)
+and an LLM rewrites the next day's plan with full autonomy (shift the mix, skip windows,
+rebalance). The proposal is clamped by `validatePlan` — **3–6 posts/day, ≤2 per window,
+≤3 Magic Hour/day (cost guard), valid generators only** — so a bad model response can
+never break posting or run up the bill. It won't deviate until ≥6 scored posts exist
+(avoids thrashing on noise); the generation cap's mandatory budget now derives from the
+plan total. 6 new `validatePlan` guardrail tests (36 total, all passing).
+
 ## Build 2 — 2026-06-21 (Memelord removed)
 
 Memelord was never legitimate (dead endpoint, non-working key). Removed entirely and

@@ -3,6 +3,7 @@
 // Does not own the clock loop or daily refresh — those live in scheduler.ts.
 
 import { BskyAgent, RichText } from "@atproto/api";
+import sharp from "sharp";
 import { v4 as uuidv4 } from "uuid";
 import { harnessedCall } from "../harness/index.js";
 import {
@@ -51,6 +52,71 @@ export async function getBskyAgent(): Promise<BskyAgent> {
   return bskyAgent;
 }
 
+// Bluesky's PDS rejects image blobs larger than ~1MB. Memegen PNGs are well under
+// this; a Magic Hour output could exceed it, in which case we fail the post with a
+// legible error instead of a cryptic API rejection.
+const MAX_BLOB_BYTES = 1_000_000;
+
+// Best-effort content type from the URL extension when the server doesn't send a
+// usable image content-type header.
+function guessImageType(url: string): string {
+  const u = url.toLowerCase();
+  if (u.includes(".jpg") || u.includes(".jpeg")) return "image/jpeg";
+  if (u.includes(".webp")) return "image/webp";
+  if (u.includes(".gif")) return "image/gif";
+  return "image/png";
+}
+
+// Downscale/recompress an over-limit image until it fits Bluesky's blob cap. Memes are
+// fine as JPEG (the small text-quality loss is invisible at these sizes), and JPEG
+// compresses the photographic Magic Hour outputs far better than PNG. Tries descending
+// widths × qualities and returns the first result under the limit.
+async function downscaleToLimit(
+  input: Uint8Array,
+  maxBytes: number
+): Promise<{ bytes: Uint8Array; encoding: string }> {
+  let smallest: Buffer | null = null;
+  for (const width of [1600, 1200, 1000, 800, 600]) {
+    for (const quality of [85, 75, 65, 55]) {
+      const out = await sharp(input)
+        .rotate() // honor EXIF orientation before resizing
+        .resize({ width, withoutEnlargement: true })
+        .jpeg({ quality, mozjpeg: true })
+        .toBuffer();
+      if (out.byteLength <= maxBytes) return { bytes: new Uint8Array(out), encoding: "image/jpeg" };
+      smallest = out;
+    }
+  }
+  // Even the smallest attempt didn't fit — surface it rather than emit a cryptic API error.
+  throw new Error(`could not downscale meme image under ${maxBytes} bytes (smallest=${smallest?.byteLength ?? "?"})`);
+}
+
+// Fetch the generated meme image (Memegen.link or Magic Hour returns only a URL) and
+// upload the bytes to the PDS as a blob, so the meme renders INLINE on Bluesky rather
+// than as an external link card. Downscales anything over Bluesky's blob cap. Returns
+// the BlobRef to embed.
+async function uploadMemeImage(agent: BskyAgent, imageUrl: string) {
+  const res = await fetch(imageUrl);
+  if (!res.ok) throw new Error(`fetch meme image failed: ${res.status} ${res.statusText}`);
+
+  const headerType = res.headers.get("content-type")?.split(";")[0]?.trim();
+  let encoding = headerType && headerType.startsWith("image/") ? headerType : guessImageType(imageUrl);
+
+  let bytes: Uint8Array = new Uint8Array(await res.arrayBuffer());
+  if (bytes.byteLength === 0) throw new Error("meme image was empty (0 bytes)");
+
+  if (bytes.byteLength > MAX_BLOB_BYTES) {
+    console.info(`[social-media] meme image ${bytes.byteLength}B exceeds ${MAX_BLOB_BYTES}B cap — downscaling`);
+    const reduced = await downscaleToLimit(bytes, MAX_BLOB_BYTES);
+    bytes = reduced.bytes;
+    encoding = reduced.encoding;
+    console.info(`[social-media] downscaled meme image to ${bytes.byteLength}B (${encoding})`);
+  }
+
+  const { data } = await agent.uploadBlob(bytes, { encoding });
+  return data.blob;
+}
+
 async function postBluesky(
   meme: GeneratedMeme,
   correlationId?: string
@@ -66,6 +132,10 @@ async function postBluesky(
     async () => {
       const agent = await getBskyAgent();
 
+      // Upload the image first so it embeds inline. A failed upload fails the post
+      // (and is retried by the harness) — we never fall back to a bare link card.
+      const blob = await uploadMemeImage(agent, meme.imageUrl);
+
       // Prefer the topic-tailored hashtags the generator produced; fall back to the
       // static defaults if the model returned none.
       const hashtags = meme.hashtags.length > 0 ? meme.hashtags : [...DEFAULT_HASHTAGS];
@@ -77,12 +147,8 @@ async function postBluesky(
         text: rt.text,
         ...(rt.facets !== undefined ? { facets: rt.facets } : {}),
         embed: {
-          $type: "app.bsky.embed.external",
-          external: {
-            uri: meme.imageUrl,
-            title: "Meme",
-            description: meme.caption,
-          },
+          $type: "app.bsky.embed.images",
+          images: [{ image: blob, alt: meme.caption.slice(0, 1000) }],
         },
       });
 

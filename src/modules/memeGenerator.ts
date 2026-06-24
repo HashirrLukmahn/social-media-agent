@@ -16,8 +16,8 @@ import { kvGet } from "../harness/store.js";
 import { getRecentTemplates } from "../harness/db.js";
 import { recallRecentTemplates, rememberPostedMeme } from "../shared/mem0.js";
 import { completeText, GENERATION_MODEL } from "../shared/llm.js";
-import { getTemplates, renderMemegen } from "./memegen.js";
-import { renderMagicHour, isDepletedError } from "./magicHour.js";
+import { getTemplates, renderMemegen, type MemegenTemplate } from "./memegen.js";
+import { renderMagicHour, isDepletedError, isMagicHourTemplate, MAGIC_HOUR_TEMPLATE_HINTS } from "./magicHour.js";
 import { assertGenerationAllowed, recordGeneration, type GenerationType } from "../shared/generationCap.js";
 import type { FallbackMeme, GeneratedMeme, Generator, StyleLog } from "../shared/types.js";
 import { BLOCKED_TOPICS, DEFAULT_HASHTAGS, NICHE, SAFETY_CONSTRAINTS } from "../shared/constants.js";
@@ -25,21 +25,41 @@ import { BLOCKED_TOPICS, DEFAULT_HASHTAGS, NICHE, SAFETY_CONSTRAINTS } from "../
 const STYLE_LOG_KEY = "style_log:today";
 const FALLBACK_BANK_KEY = "fallback_bank";
 
-// Curated Memegen.link templates + when to use each. Only those present in the live
-// catalog are offered to the model (the rest are silently dropped), so the model
-// can only pick a valid id. drake/fine/aag are the guaranteed-present anchors.
+// Curated Memegen.link templates + when to use each — these come with usage notes so
+// the model picks them well. They are NOT the only options: the model may also pick any
+// other id from the live catalog (see generateMemeSpec). Every id here is verified to
+// exist in the catalog; drake/fine/aag are the guaranteed-present anchors.
 const TEMPLATE_HINTS: Record<string, string> = {
   drake: "comparison / preference: reject the top option, prefer the bottom",
   fine: "'this is fine': calm denial while everything is on fire / chaos",
-  aag: "'always has been': realizing something was true all along (top 'wait, it's all X?', bottom 'always has been')",
-  gru: "a plan whose final step backfires on the planner",
+  aag: "Ancient Aliens guy: hand-waving an absurd or hard-to-explain cause for something ('I'm not saying it's X, but it's the cache')",
+  gru: "Gru's Plan: a multi-step plan whose final step backfires on the planner",
   db: "distracted boyfriend: tempted by a shiny new thing over the current one",
   spongebob: "mocking SpongeBob: sarcastic mocking repetition of someone's words",
   success: "success kid: a small, unexpected win",
   disastergirl: "smug in front of a disaster you quietly caused",
-  rollsafe: "tapping head: dubious 'can't have a problem if...' galaxy-brain logic",
+  rollsafe: "Roll Safe tapping head: dubious 'can't have a problem if...' galaxy-brain logic",
   fry: "Futurama Fry: 'not sure if X or just Y'",
-  ds: "two buttons: sweating over two conflicting options",
+  ds: "Daily Struggle / two buttons: sweating over two conflicting options",
+  mordor: "'one does not simply X': understating how genuinely hard something is",
+  buzz: "'X, X everywhere': pointing out something is suddenly all over the place",
+  doge: "doge-speak: 'much X, very Y, wow' — ironic enthusiasm",
+  philosoraptor: "an overthought, deep rhetorical question",
+  grumpycat: "a flat, deadpan 'no' / total lack of enthusiasm",
+  yodawg: "'yo dawg I put an X in your Y' — recursion / nesting a thing inside itself",
+  fwp: "first-world (developer) problems: a trivial complaint framed as real suffering",
+  oprah: "'you get an X! everyone gets an X!' — everything suddenly getting some feature",
+  cmm: "'change my mind': a bold or controversial opinion stated as settled fact (one line)",
+  both: "'why not both?': refusing to choose between two options",
+  cb: "confession bear: admitting an awkward or guilty truth",
+  keanu: "conspiracy Keanu: 'what if X was actually Y all along?'",
+  facepalm: "Picard facepalm: exasperation at something obviously dumb",
+  money: "'shut up and take my money': wanting something instantly / no questions",
+  blb: "Bad Luck Brian: the worst possible outcome from a normal action",
+  interesting: "Most Interesting Man: 'I don't always X, but when I do, Y'",
+  stonks: "Stonks: an ill-advised move framed as a genius financial play",
+  "woman-cat": "woman yelling at a cat: a heated accusation vs. a smug/confused denial",
+  yuno: "'Y U NO': frustration that someone or something won't just do the thing",
 };
 const ANCHOR_TEMPLATES = ["drake", "fine", "aag"];
 
@@ -50,6 +70,9 @@ const MIN_TEMPLATE_CHOICES = 4;
 
 interface MemeSpec {
   template: string;
+  // Best-fit Magic Hour template (one of its 13 accepted values) for this joke. Only
+  // used on the Magic Hour path; "Random" lets Magic Hour choose. Ignored for Memegen.
+  magicHourTemplate: string;
   topText: string;
   bottomText: string;
   caption: string;
@@ -138,50 +161,75 @@ function selectTopic(styleLog: StyleLog): string {
 async function generateMemeSpec(
   styleLog: StyleLog,
   topic: string,
-  validTemplateIds: Set<string>,
+  templates: Map<string, MemegenTemplate>,
   recentTemplates: string[],
+  wantMagicHourTemplate: boolean,
   correlationId?: string
 ): Promise<MemeSpec> {
-  const available = Object.entries(TEMPLATE_HINTS).filter(([id]) => validTemplateIds.has(id));
   const recentSet = new Set(recentTemplates);
 
-  // Drop recently-used templates — but if that leaves too few, relax the guard so we
-  // always have a usable menu (e.g. catalog shrank or every template was just used).
-  const trimmed = available.filter(([id]) => !recentSet.has(id));
-  const offered = trimmed.length >= MIN_TEMPLATE_CHOICES ? trimmed : available;
+  // Curated formats WITH usage notes (valid + not recently used). Drop recently-used,
+  // but relax if that leaves too few so there's always a usable recommended set.
+  const curatedAll = Object.entries(TEMPLATE_HINTS).filter(([id]) => templates.has(id));
+  const curatedFresh = curatedAll.filter(([id]) => !recentSet.has(id));
+  const curated = curatedFresh.length >= MIN_TEMPLATE_CHOICES ? curatedFresh : curatedAll;
+  const curatedMenu = curated.map(([id, hint]) => `- ${id}: ${hint}`).join("\n");
+  const curatedIds = new Set(curated.map(([id]) => id));
 
-  // Only ids actually on the menu are valid picks (and valid fallbacks), so the guard
-  // can't be bypassed by the model returning a blocked id or the parser defaulting to one.
-  const allowedIds = new Set(offered.map(([id]) => id));
-  const menu = offered.map(([id, hint]) => `- ${id}: ${hint}`).join("\n");
+  // FULL OPEN CATALOG: the model may pick ANY catalog id (minus recently-used ones).
+  // The curated set just provides usage notes; the rest of the catalog is offered by
+  // id + name so the model can match the joke or a trending format to any template.
+  const pickable = new Set([...templates.keys()].filter((id) => !recentSet.has(id)));
+  const validForPick = pickable.size > 0 ? pickable : new Set(templates.keys());
+  const otherCatalog = [...templates.values()]
+    .filter((t) => validForPick.has(t.id) && !curatedIds.has(t.id))
+    .map((t) => `${t.id} (${t.name})`)
+    .join(", ");
+
   const defaultTemplate =
-    offered.find(([id]) => ANCHOR_TEMPLATES.includes(id))?.[0] ?? offered[0]?.[0] ?? "drake";
+    curated.find(([id]) => ANCHOR_TEMPLATES.includes(id))?.[0] ?? curated[0]?.[0] ?? "drake";
 
   const avoidNote =
     recentTemplates.length > 0
-      ? `\n\nRecently used templates (already excluded from the menu — do NOT ask for them): ${recentTemplates.join(", ")}. Vary the format.`
+      ? `\n\nRecently used templates (do NOT use any of these again — vary the format): ${recentTemplates.join(", ")}.`
       : "";
 
-  const system = `You write a single software-engineering humor meme for a Bluesky audience. Pick ONE meme template from the menu whose structure best fits the joke, write the on-image text, and a separate short Bluesky caption.
+  // When this post renders via Magic Hour (a separate generator with its own fixed set
+  // of formats), also ask the model to pick the best-fit Magic Hour format for the joke.
+  const mhMenu = Object.entries(MAGIC_HOUR_TEMPLATE_HINTS).map(([id, hint]) => `- ${id}: ${hint}`).join("\n");
+  const mhRule = wantMagicHourTemplate
+    ? `\n- magicHourTemplate: from the Magic Hour formats menu, pick the ONE that best fits this joke (use "Random" if none clearly fits).`
+    : "";
+  const mhJsonField = wantMagicHourTemplate ? `, "magicHourTemplate": "<one from the Magic Hour menu>"` : "";
+  const mhUserBlock = wantMagicHourTemplate
+    ? `\n\nMagic Hour formats (pick the closest fit for magicHourTemplate):\n${mhMenu}`
+    : "";
+
+  const system = `You write a single software-engineering humor meme for a Bluesky audience. Choose the meme template whose structure best fits the joke, write the on-image text, and a separate short Bluesky caption.
 
 ${SAFETY_CONSTRAINTS}
 
 Rules:
+- template: pick the Memegen template id that best fits the joke. The RECOMMENDED formats come with usage notes — prefer one of them. But you MAY use ANY id from the full catalog list if it fits the joke (or a current/trending meme format) better. Always return an EXACT id from one of the two lists; never invent an id.
+- IMPORTANT: only two text lines are rendered (top and bottom). Pick a format that reads well with one or two lines — avoid multi-panel formats that would need three or more separate captions.
 - topText / bottomText are the words ON the image. Keep each short and punchy. If the template only needs one line, put it in topText and leave bottomText empty.
 - caption is the Bluesky post text that accompanies the image — one relatable line, no hashtags (those go in the hashtags field).
 - Style: dry, absurdist, or relatable-pain humor. Let the image carry the setup.
 - reasoning: 1-2 sentences on why this template's structure fits the joke. Prefer a template that suits the joke over always reaching for the same one.
 - themesReferenced: list the specific inputs you actually drew on for this meme (e.g. a trending theme, a current event, an audience or format note). Use [] if you only used the base topic. Quote the input briefly, do not invent new ones.
-- hashtags: 3-5 Bluesky hashtags tailored to THIS meme's topic and themes (each starts with #, no spaces). Mix one or two broad discovery tags with more specific ones tied to the joke.
+- hashtags: 3-5 Bluesky hashtags tailored to THIS meme's topic and themes (each starts with #, no spaces). Mix one or two broad discovery tags with more specific ones tied to the joke.${mhRule}
 
 Respond with ONLY valid JSON, no markdown:
-{ "template": "<one id from the menu>", "topText": "...", "bottomText": "...", "caption": "...", "reasoning": "...", "themesReferenced": ["..."], "hashtags": ["#..."] }`;
+{ "template": "<an exact template id>"${mhJsonField}, "topText": "...", "bottomText": "...", "caption": "...", "reasoning": "...", "themesReferenced": ["..."], "hashtags": ["#..."] }`;
 
   const user = `Topic: ${topic}
 Niche: ${styleLog.niche}${styleContext(styleLog)}${avoidNote}
 
-Template menu (choose the id whose structure fits the joke best):
-${menu}`;
+RECOMMENDED formats (id: when to use) — prefer one of these:
+${curatedMenu}
+
+FULL CATALOG (you may also pick any of these ids if one fits better):
+${otherCatalog}${mhUserBlock}`;
 
   // Sonnet 4.6 for the creative spec — Haiku's jokes/templates were too repetitive.
   const text = await completeText({ system, user, maxTokens: 512, model: GENERATION_MODEL });
@@ -189,6 +237,7 @@ ${menu}`;
 
   let parsed: {
     template?: unknown;
+    magicHourTemplate?: unknown;
     topText?: unknown;
     bottomText?: unknown;
     caption?: unknown;
@@ -203,9 +252,15 @@ ${menu}`;
     parsed = {};
   }
 
-  const template = typeof parsed.template === "string" && allowedIds.has(parsed.template)
+  // Accept any valid catalog id the model returned (full open catalog), falling back
+  // to a known anchor only when the pick is missing or not a real template.
+  const template = typeof parsed.template === "string" && validForPick.has(parsed.template)
     ? parsed.template
     : defaultTemplate;
+  // Validate against Magic Hour's closed enum; anything else (incl. omitted) → "Random".
+  const magicHourTemplate = typeof parsed.magicHourTemplate === "string" && isMagicHourTemplate(parsed.magicHourTemplate)
+    ? parsed.magicHourTemplate
+    : "Random";
   const topText = typeof parsed.topText === "string" ? parsed.topText : topic;
   const bottomText = typeof parsed.bottomText === "string" ? parsed.bottomText : "";
   const caption = typeof parsed.caption === "string" && parsed.caption.length > 0 ? parsed.caption : topic;
@@ -215,7 +270,7 @@ ${menu}`;
     : [];
   const hashtags = normalizeHashtags(parsed.hashtags);
 
-  return { template, topText, bottomText, caption, reasoning, themesReferenced, hashtags };
+  return { template, magicHourTemplate, topText, bottomText, caption, reasoning, themesReferenced, hashtags };
 }
 
 export async function getFallbackMeme(): Promise<GeneratedMeme | null> {
@@ -298,6 +353,12 @@ export async function generateMeme(
     console.info(`[meme-generator] avoiding recently-used templates: ${recentTemplates.join(", ")}`);
   }
 
+  // Route to Magic Hour when the slot asks for it (generator:"magichour", or the
+  // legacy preferMagicHour flag). Both scheduled and exploratory posts may use it; it
+  // degrades to Memegen.link below if the balance is depleted. Decided before the spec
+  // so the model is asked to pick a Magic Hour format only when one is actually needed.
+  const useMagicHour = options?.generator === "magichour" || options?.preferMagicHour === true;
+
   try {
     const templates = await getTemplates();
     const spec = await harnessedCall(
@@ -309,13 +370,8 @@ export async function generateMeme(
         attempts: 3,
         baseDelayMs: 1000,
       },
-      () => generateMemeSpec(styleLog, topic, new Set(templates.keys()), recentTemplates, correlationId)
+      () => generateMemeSpec(styleLog, topic, templates, recentTemplates, useMagicHour, correlationId)
     );
-
-    // Route to Magic Hour when the slot asks for it (generator:"magichour", or the
-    // legacy preferMagicHour flag). Both scheduled and exploratory posts may use it;
-    // it degrades to Memegen.link below if the balance is depleted.
-    const useMagicHour = options?.generator === "magichour" || options?.preferMagicHour === true;
 
     let imageUrl: string;
     let generator: GeneratedMeme["generator"];
@@ -323,8 +379,8 @@ export async function generateMeme(
     if (useMagicHour) {
       try {
         imageUrl = await harnessedCall(
-          { agentName: "meme-generator", action: "magic-hour-generate", input: { slotId, topic }, correlationId },
-          () => renderMagicHour(topic)
+          { agentName: "meme-generator", action: "magic-hour-generate", input: { slotId, topic, template: spec.magicHourTemplate }, correlationId },
+          () => renderMagicHour(topic, spec.magicHourTemplate)
         );
         generator = "magichour";
       } catch (mhErr) {

@@ -24,6 +24,7 @@
     "mem0ai": "^3.0.9",
     "postgres": "^3.4.5",
     "redis": "^4.7.0",
+    "sharp": "^0.35.2",
     "uuid": "^11.0.0"
   },
   "devDependencies": {
